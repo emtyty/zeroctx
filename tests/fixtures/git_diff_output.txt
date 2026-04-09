@@ -1,0 +1,20 @@
+diff --git a/src/main.rs b/src/main.rs
+index abc1234..def5678 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -10,7 +10,7 @@ fn main() {
+     let config = Config::load().unwrap();
+-    let old_value = 42;
++    let new_value = 100;
+     println!("Starting...");
+ }
+
+diff --git a/src/lib.rs b/src/lib.rs
+index 111aaaa..222bbbb 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,5 @@
++use std::io;
++
+ pub mod core;
+ pub mod filters;

@@ -1,0 +1,12 @@
+/target
+*.exe
+*.dll
+*.so
+*.dylib
+Cargo.lock
+*.db
+*.tmp
+*.tmp.html
+.zeroctx/
+plan.html
+report.html

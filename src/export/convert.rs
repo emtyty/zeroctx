@@ -1,0 +1,442 @@
+use anyhow::{Context, Result};
+use once_cell::sync::Lazy;
+use regex::Regex;
+use std::path::Path;
+
+/// Convert a markdown file to HTML or PDF.
+pub fn convert_file(
+    path: &str,
+    format: &str,
+    output: Option<&str>,
+    title: Option<&str>,
+) -> Result<()> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read: {}", path))?;
+
+    let filename = Path::new(path)
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("document");
+
+    let page_title = title.unwrap_or(filename);
+
+    match format {
+        "html" => {
+            let html = markdown_to_html(&content, page_title);
+            let out_path = output
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}.html", filename));
+            std::fs::write(&out_path, &html)
+                .with_context(|| format!("Failed to write: {}", out_path))?;
+            println!("Converted to HTML: {}", out_path);
+        }
+        "pdf" => {
+            // Generate HTML first, then convert to PDF
+            let html = markdown_to_html(&content, page_title);
+            let html_path = format!("{}.tmp.html", filename);
+            std::fs::write(&html_path, &html)?;
+
+            let pdf_path = output
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}.pdf", filename));
+
+            let converted = try_html_to_pdf(&html_path, &pdf_path);
+            let _ = std::fs::remove_file(&html_path);
+
+            if !converted {
+                // Fallback: save HTML instead
+                let fallback = format!("{}.html", pdf_path.trim_end_matches(".pdf"));
+                std::fs::write(&fallback, &html)?;
+                println!("PDF tools not found. Saved HTML to: {}", fallback);
+                println!("To convert: wkhtmltopdf {} {}", fallback, pdf_path);
+            }
+        }
+        _ => anyhow::bail!("Unsupported format: {}. Use 'html' or 'pdf'.", format),
+    }
+
+    Ok(())
+}
+
+/// Convert markdown to styled HTML.
+fn markdown_to_html(markdown: &str, title: &str) -> String {
+    let body = render_markdown(markdown);
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{title}</title>
+<style>
+:root {{
+  --bg: #ffffff;
+  --fg: #1a1a2e;
+  --muted: #6c757d;
+  --accent: #e94560;
+  --accent2: #0f3460;
+  --border: #dee2e6;
+  --code-bg: #f4f5f7;
+  --block-bg: #f8f9fa;
+  --table-head: #1a1a2e;
+  --table-stripe: #f8f9fa;
+  --link: #0f3460;
+}}
+* {{ box-sizing: border-box; margin: 0; padding: 0; }}
+body {{
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  line-height: 1.7;
+  color: var(--fg);
+  background: var(--bg);
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 40px 24px 80px;
+}}
+h1 {{
+  font-size: 2em;
+  color: var(--accent2);
+  border-bottom: 3px solid var(--accent);
+  padding-bottom: 12px;
+  margin: 32px 0 20px;
+}}
+h2 {{
+  font-size: 1.5em;
+  color: var(--accent2);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 8px;
+  margin: 28px 0 16px;
+}}
+h3 {{
+  font-size: 1.2em;
+  color: var(--fg);
+  margin: 24px 0 12px;
+}}
+h4, h5, h6 {{ margin: 20px 0 8px; }}
+p {{ margin: 12px 0; }}
+a {{ color: var(--link); text-decoration: none; }}
+a:hover {{ text-decoration: underline; }}
+strong {{ font-weight: 600; }}
+hr {{
+  border: none;
+  height: 2px;
+  background: var(--border);
+  margin: 32px 0;
+}}
+ul, ol {{
+  margin: 12px 0;
+  padding-left: 28px;
+}}
+li {{ margin: 4px 0; }}
+code {{
+  font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace;
+  font-size: 0.88em;
+  background: var(--code-bg);
+  padding: 2px 6px;
+  border-radius: 4px;
+}}
+pre {{
+  background: var(--fg);
+  color: #e8e8e8;
+  padding: 16px 20px;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 16px 0;
+  line-height: 1.5;
+}}
+pre code {{
+  background: none;
+  padding: 0;
+  color: inherit;
+  font-size: 0.85em;
+}}
+blockquote {{
+  border-left: 4px solid var(--accent);
+  padding: 8px 16px;
+  margin: 16px 0;
+  background: var(--block-bg);
+  color: var(--muted);
+}}
+table {{
+  width: 100%;
+  border-collapse: collapse;
+  margin: 16px 0;
+  font-size: 0.92em;
+}}
+thead th {{
+  background: var(--table-head);
+  color: #fff;
+  padding: 10px 14px;
+  text-align: left;
+  font-weight: 600;
+}}
+tbody td {{
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border);
+}}
+tbody tr:nth-child(even) {{ background: var(--table-stripe); }}
+tbody tr:hover {{ background: #e9ecef; }}
+.footer {{
+  margin-top: 48px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.8em;
+}}
+@media print {{
+  body {{ max-width: 100%; padding: 20px; }}
+  pre {{ white-space: pre-wrap; word-break: break-all; }}
+}}
+</style>
+</head>
+<body>
+{body}
+<div class="footer">Generated by ZeroCTX v{version}</div>
+</body>
+</html>"#,
+        title = escape_html(title),
+        body = body,
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// Simple markdown renderer — handles the common elements.
+fn render_markdown(md: &str) -> String {
+    static BOLD: Lazy<Regex> = Lazy::new(|| Regex::new(r"\*\*(.+?)\*\*").expect("valid"));
+    static ITALIC: Lazy<Regex> = Lazy::new(|| Regex::new(r"\*(.+?)\*").expect("valid"));
+    static INLINE_CODE: Lazy<Regex> = Lazy::new(|| Regex::new(r"`([^`]+)`").expect("valid"));
+    static LINK: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").expect("valid"));
+    static IMAGE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"!\[([^\]]*)\]\(([^)]+)\)").expect("valid"));
+
+    let mut html = String::with_capacity(md.len() * 2);
+    let mut in_code_block = false;
+    let mut code_lang = String::new();
+    let mut code_buf = String::new();
+    let mut in_table = false;
+    let mut table_header_done = false;
+    let mut in_list = false;
+    let mut list_type = "ul";
+
+    for line in md.lines() {
+        // Code blocks
+        if line.trim_start().starts_with("```") {
+            if in_code_block {
+                html.push_str(&format!("<pre><code class=\"lang-{}\">{}</code></pre>\n",
+                    code_lang, escape_html(&code_buf)));
+                code_buf.clear();
+                code_lang.clear();
+                in_code_block = false;
+            } else {
+                in_code_block = true;
+                code_lang = line.trim_start().trim_start_matches('`').to_string();
+            }
+            continue;
+        }
+        if in_code_block {
+            if !code_buf.is_empty() {
+                code_buf.push('\n');
+            }
+            code_buf.push_str(line);
+            continue;
+        }
+
+        let trimmed = line.trim();
+
+        // Close table if non-table line
+        if in_table && !trimmed.starts_with('|') {
+            html.push_str("</tbody></table>\n");
+            in_table = false;
+            table_header_done = false;
+        }
+
+        // Close list if non-list line
+        if in_list && !trimmed.starts_with("- ") && !trimmed.starts_with("* ")
+            && !(trimmed.len() > 2 && trimmed.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) && trimmed.contains(". "))
+            && !trimmed.is_empty()
+        {
+            html.push_str(&format!("</{}>\n", list_type));
+            in_list = false;
+        }
+
+        // Empty line
+        if trimmed.is_empty() {
+            if !in_list {
+                html.push('\n');
+            }
+            continue;
+        }
+
+        // Horizontal rule
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            html.push_str("<hr>\n");
+            continue;
+        }
+
+        // Headers
+        if let Some(rest) = trimmed.strip_prefix("# ") {
+            html.push_str(&format!("<h1>{}</h1>\n", inline_format(rest, &BOLD, &ITALIC, &INLINE_CODE, &LINK, &IMAGE)));
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            html.push_str(&format!("<h2>{}</h2>\n", inline_format(rest, &BOLD, &ITALIC, &INLINE_CODE, &LINK, &IMAGE)));
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("### ") {
+            html.push_str(&format!("<h3>{}</h3>\n", inline_format(rest, &BOLD, &ITALIC, &INLINE_CODE, &LINK, &IMAGE)));
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("#### ") {
+            html.push_str(&format!("<h4>{}</h4>\n", inline_format(rest, &BOLD, &ITALIC, &INLINE_CODE, &LINK, &IMAGE)));
+            continue;
+        }
+
+        // Blockquote
+        if let Some(rest) = trimmed.strip_prefix("> ") {
+            html.push_str(&format!("<blockquote>{}</blockquote>\n", inline_format(rest, &BOLD, &ITALIC, &INLINE_CODE, &LINK, &IMAGE)));
+            continue;
+        }
+
+        // Table
+        if trimmed.starts_with('|') && trimmed.ends_with('|') {
+            // Skip separator rows (|---|---|)
+            if trimmed.contains("---") {
+                table_header_done = true;
+                continue;
+            }
+            let cells: Vec<&str> = trimmed
+                .trim_matches('|')
+                .split('|')
+                .map(|c| c.trim())
+                .collect();
+
+            if !in_table {
+                html.push_str("<table>\n<thead><tr>");
+                for cell in &cells {
+                    html.push_str(&format!("<th>{}</th>",
+                        inline_format(cell, &BOLD, &ITALIC, &INLINE_CODE, &LINK, &IMAGE)));
+                }
+                html.push_str("</tr></thead>\n<tbody>\n");
+                in_table = true;
+            } else {
+                html.push_str("<tr>");
+                for cell in &cells {
+                    html.push_str(&format!("<td>{}</td>",
+                        inline_format(cell, &BOLD, &ITALIC, &INLINE_CODE, &LINK, &IMAGE)));
+                }
+                html.push_str("</tr>\n");
+            }
+            continue;
+        }
+
+        // Unordered list
+        if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+            if !in_list {
+                list_type = "ul";
+                html.push_str("<ul>\n");
+                in_list = true;
+            }
+            html.push_str(&format!("<li>{}</li>\n",
+                inline_format(rest, &BOLD, &ITALIC, &INLINE_CODE, &LINK, &IMAGE)));
+            continue;
+        }
+
+        // Ordered list
+        if trimmed.len() > 2 {
+            if let Some(dot_pos) = trimmed.find(". ") {
+                let prefix = &trimmed[..dot_pos];
+                if prefix.chars().all(|c| c.is_ascii_digit()) {
+                    let rest = &trimmed[dot_pos + 2..];
+                    if !in_list || list_type != "ol" {
+                        if in_list {
+                            html.push_str(&format!("</{}>\n", list_type));
+                        }
+                        list_type = "ol";
+                        html.push_str("<ol>\n");
+                        in_list = true;
+                    }
+                    html.push_str(&format!("<li>{}</li>\n",
+                        inline_format(rest, &BOLD, &ITALIC, &INLINE_CODE, &LINK, &IMAGE)));
+                    continue;
+                }
+            }
+        }
+
+        // Regular paragraph
+        html.push_str(&format!("<p>{}</p>\n",
+            inline_format(trimmed, &BOLD, &ITALIC, &INLINE_CODE, &LINK, &IMAGE)));
+    }
+
+    // Close any open blocks
+    if in_code_block {
+        html.push_str(&format!("<pre><code>{}</code></pre>\n", escape_html(&code_buf)));
+    }
+    if in_table {
+        html.push_str("</tbody></table>\n");
+    }
+    if in_list {
+        html.push_str(&format!("</{}>\n", list_type));
+    }
+
+    html
+}
+
+/// Apply inline formatting (bold, italic, code, links).
+fn inline_format(
+    text: &str,
+    bold: &Regex,
+    italic: &Regex,
+    code: &Regex,
+    link: &Regex,
+    image: &Regex,
+) -> String {
+    let escaped = escape_html(text);
+    // Order matters: code first (to not process content inside backticks)
+    let s = code.replace_all(&escaped, "<code>$1</code>");
+    let s = image.replace_all(&s, "<img src=\"$2\" alt=\"$1\">");
+    let s = link.replace_all(&s, "<a href=\"$2\">$1</a>");
+    let s = bold.replace_all(&s, "<strong>$1</strong>");
+    let s = italic.replace_all(&s, "<em>$1</em>");
+    s.to_string()
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn try_html_to_pdf(html_path: &str, pdf_path: &str) -> bool {
+    // Try wkhtmltopdf
+    if let Ok(output) = std::process::Command::new("wkhtmltopdf")
+        .args(["--quiet", html_path, pdf_path])
+        .output()
+    {
+        if output.status.success() {
+            println!("Converted to PDF: {}", pdf_path);
+            return true;
+        }
+    }
+
+    // Try Chrome headless
+    for chrome in &["chrome", "google-chrome", "chromium"] {
+        if let Ok(output) = std::process::Command::new(chrome)
+            .args([
+                "--headless",
+                "--disable-gpu",
+                "--no-sandbox",
+                &format!("--print-to-pdf={}", pdf_path),
+                html_path,
+            ])
+            .output()
+        {
+            if output.status.success() {
+                println!("Converted to PDF: {}", pdf_path);
+                return true;
+            }
+        }
+    }
+
+    false
+}
