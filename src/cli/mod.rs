@@ -302,13 +302,11 @@ impl Cli {
                         }
 
                         // Track repeated reads of the same file (potential compression mismatch)
-                        if let Ok(mismatch_tracker) = crate::core::mismatch::MismatchTracker::open(None) {
-                            let _ = mismatch_tracker.record_signal(
-                                "file_read",
-                                &format!("read {}", path),
-                                &format!("{{\"path\": \"{}\"}}", path),
-                            );
-                        }
+                        crate::core::mismatch::log_signal(
+                            "file_read",
+                            &format!("read {}", path),
+                            &format!("{{\"path\": \"{}\"}}", path),
+                        );
 
                         print!("{}", temp_path);
                         std::process::exit(0);

@@ -1,7 +1,26 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::debug;
+
+/// Whether tables have been initialized in this process.
+static TABLES_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Log a mismatch event — convenience function that opens connection only when needed.
+/// All instrumentation code should call this instead of MismatchTracker::open() directly.
+pub fn log_event(event: &MismatchEvent) {
+    if let Ok(tracker) = MismatchTracker::open(None) {
+        let _ = tracker.record(event);
+    }
+}
+
+/// Log a mismatch signal — convenience function.
+pub fn log_signal(signal_type: &str, operation: &str, metadata: &str) {
+    if let Ok(tracker) = MismatchTracker::open(None) {
+        let _ = tracker.record_signal(signal_type, operation, metadata);
+    }
+}
 
 /// Mismatch category — which agent/phase produced the mismatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,7 +133,10 @@ impl MismatchTracker {
             }
         };
         let tracker = Self { conn };
-        tracker.init_tables()?;
+        // Only init tables once per process
+        if !TABLES_INITIALIZED.swap(true, Ordering::Relaxed) {
+            tracker.init_tables()?;
+        }
         Ok(tracker)
     }
 

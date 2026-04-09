@@ -6,7 +6,7 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::config::Config;
-use crate::core::mismatch::{MismatchCategory, MismatchEvent, MismatchSeverity, MismatchTracker};
+use crate::core::mismatch::{MismatchCategory, MismatchEvent, MismatchSeverity};
 use crate::core::types::Language;
 
 /// Minimum lines before compression kicks in.
@@ -52,24 +52,22 @@ pub fn compress_file(path: &str, _config: &Config) -> Result<String> {
 
             // Track extreme compression as potential mismatch
             if savings_pct > 95 && line_count > 200 {
-                if let Ok(tracker) = MismatchTracker::open(None) {
-                    let _ = tracker.record(&MismatchEvent {
-                        category: MismatchCategory::Compression,
-                        severity: MismatchSeverity::Info,
-                        detected: format!(
-                            "tree_sitter, lang={:?}, savings={}%",
-                            lang, savings_pct
-                        ),
-                        actual: format!(
-                            "{}→{} lines (may lose important context)",
-                            line_count,
-                            compressed.lines().count()
-                        ),
-                        input_snippet: path.to_string(),
-                        context: format!("method=tree_sitter, original_lines={}", line_count),
-                        user_feedback: None,
-                    });
-                }
+                crate::core::mismatch::log_event(&MismatchEvent {
+                    category: MismatchCategory::Compression,
+                    severity: MismatchSeverity::Info,
+                    detected: format!(
+                        "tree_sitter, lang={:?}, savings={}%",
+                        lang, savings_pct
+                    ),
+                    actual: format!(
+                        "{}→{} lines (may lose important context)",
+                        line_count,
+                        compressed.lines().count()
+                    ),
+                    input_snippet: path.to_string(),
+                    context: format!("method=tree_sitter, original_lines={}", line_count),
+                    user_feedback: None,
+                });
             }
 
             let header = format!(
@@ -83,16 +81,14 @@ pub fn compress_file(path: &str, _config: &Config) -> Result<String> {
         }
         _ => {
             // Fallback to basic compression — log as signal
-            if let Ok(tracker) = MismatchTracker::open(None) {
-                let _ = tracker.record_signal(
-                    "fallback_used",
-                    &format!("compress {}", path),
-                    &format!(
-                        "{{\"language\": \"{:?}\", \"lines\": {}, \"reason\": \"ast_failed\"}}",
-                        lang, line_count
-                    ),
-                );
-            }
+            crate::core::mismatch::log_signal(
+                "fallback_used",
+                &format!("compress {}", path),
+                &format!(
+                    "{{\"language\": \"{:?}\", \"lines\": {}, \"reason\": \"ast_failed\"}}",
+                    lang, line_count
+                ),
+            );
 
             Ok(basic_compress(&content))
         }

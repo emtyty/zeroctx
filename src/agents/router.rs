@@ -2,7 +2,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use std::path::PathBuf;
 
-use crate::core::mismatch::{MismatchCategory, MismatchEvent, MismatchSeverity, MismatchTracker};
+use crate::core::mismatch::{MismatchCategory, MismatchEvent, MismatchSeverity};
 use crate::core::types::{Intent, ParsedRequest, SubTask};
 
 /// Regex-based intent router — zero token cost.
@@ -176,17 +176,15 @@ impl IntentRouter {
                     MismatchSeverity::Info
                 };
 
-                if let Ok(tracker) = MismatchTracker::open(None) {
-                    let _ = tracker.record(&MismatchEvent {
-                        category: MismatchCategory::IntentRouting,
-                        severity,
-                        detected: format!("{:?}", chosen),
-                        actual: String::new(), // unknown until user feedback
-                        input_snippet: request.to_string(),
-                        context: format!("competing: [{}]", competing_str.join(", ")),
-                        user_feedback: None,
-                    });
-                }
+                crate::core::mismatch::log_event(&MismatchEvent {
+                    category: MismatchCategory::IntentRouting,
+                    severity,
+                    detected: format!("{:?}", chosen),
+                    actual: String::new(),
+                    input_snippet: request.to_string(),
+                    context: format!("competing: [{}]", competing_str.join(", ")),
+                    user_feedback: None,
+                });
 
                 tracing::debug!(
                     chosen = ?chosen,

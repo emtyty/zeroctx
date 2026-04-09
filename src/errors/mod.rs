@@ -3,7 +3,7 @@ pub mod patterns;
 
 use anyhow::Result;
 
-use crate::core::mismatch::{MismatchCategory, MismatchEvent, MismatchSeverity, MismatchTracker};
+use crate::core::mismatch::{MismatchCategory, MismatchEvent, MismatchSeverity};
 use crate::core::types::AutoFix;
 
 /// Classify an error from command output and return an auto-fix if possible.
@@ -38,29 +38,27 @@ pub fn execute_fix(fix: &AutoFix) -> Result<String> {
             ))
         } else {
             // Auto-fix failed — record as mismatch
-            if let Ok(tracker) = MismatchTracker::open(None) {
-                let _ = tracker.record(&MismatchEvent {
-                    category: MismatchCategory::AutoFix,
-                    severity: MismatchSeverity::Error,
-                    detected: format!(
-                        "pattern={}, fix_cmd={}",
-                        fix.category,
-                        cmd
-                    ),
-                    actual: format!(
-                        "fix failed (exit {}): {}",
-                        output.exit_code,
-                        truncate(&output.stderr, 300)
-                    ),
-                    input_snippet: fix.explanation.clone(),
-                    context: format!(
-                        "language={:?}, stdout_preview={}",
-                        fix.language,
-                        truncate(&output.stdout, 200)
-                    ),
-                    user_feedback: None,
-                });
-            }
+            crate::core::mismatch::log_event(&MismatchEvent {
+                category: MismatchCategory::AutoFix,
+                severity: MismatchSeverity::Error,
+                detected: format!(
+                    "pattern={}, fix_cmd={}",
+                    fix.category,
+                    cmd
+                ),
+                actual: format!(
+                    "fix failed (exit {}): {}",
+                    output.exit_code,
+                    truncate(&output.stderr, 300)
+                ),
+                input_snippet: fix.explanation.clone(),
+                context: format!(
+                    "language={:?}, stdout_preview={}",
+                    fix.language,
+                    truncate(&output.stdout, 200)
+                ),
+                user_feedback: None,
+            });
 
             Ok(format!(
                 "Auto-fix attempted but failed (exit {}):\n{}\n{}",
@@ -92,22 +90,20 @@ pub fn execute_fix_and_verify(
             if let Some(new_fix) = classify(&verify.stderr, &verify.stdout, ".") {
                 if new_fix.category == fix.category {
                     // Same error pattern still matches — fix didn't work
-                    if let Ok(tracker) = MismatchTracker::open(None) {
-                        let _ = tracker.record(&MismatchEvent {
-                            category: MismatchCategory::AutoFix,
-                            severity: MismatchSeverity::Error,
-                            detected: format!("pattern={}, fix_cmd={}", fix.category, fix.command.as_deref().unwrap_or("none")),
-                            actual: "same error persists after fix".into(),
-                            input_snippet: truncate(original_stderr, 300),
-                            context: format!("verify_stderr: {}", truncate(&verify.stderr, 200)),
-                            user_feedback: None,
-                        });
-                        let _ = tracker.record_signal(
-                            "autofix_rerun",
-                            original_command,
-                            &format!("{{\"category\": \"{}\"}}", fix.category),
-                        );
-                    }
+                    crate::core::mismatch::log_event(&MismatchEvent {
+                        category: MismatchCategory::AutoFix,
+                        severity: MismatchSeverity::Error,
+                        detected: format!("pattern={}, fix_cmd={}", fix.category, fix.command.as_deref().unwrap_or("none")),
+                        actual: "same error persists after fix".into(),
+                        input_snippet: truncate(original_stderr, 300),
+                        context: format!("verify_stderr: {}", truncate(&verify.stderr, 200)),
+                        user_feedback: None,
+                    });
+                    crate::core::mismatch::log_signal(
+                        "autofix_rerun",
+                        original_command,
+                        &format!("{{\"category\": \"{}\"}}", fix.category),
+                    );
                 }
             }
         }

@@ -8,7 +8,7 @@ pub mod system;
 pub mod toml_filter;
 
 use crate::config::Config;
-use crate::core::mismatch::{MismatchCategory, MismatchEvent, MismatchSeverity, MismatchTracker};
+use crate::core::mismatch::{MismatchCategory, MismatchEvent, MismatchSeverity};
 use crate::core::types::FilterResult;
 
 /// Trait for output filters. Each filter handles a specific command category.
@@ -62,27 +62,25 @@ impl FilterRegistry {
                     && result.savings_percent > OVER_FILTER_THRESHOLD
                     && result.filtered_lines <= 2
                 {
-                    if let Ok(tracker) = MismatchTracker::open(None) {
-                        let _ = tracker.record(&MismatchEvent {
-                            category: MismatchCategory::OutputFilter,
-                            severity: MismatchSeverity::Warn,
-                            detected: format!(
-                                "filter={}, savings={:.1}%",
-                                filter.name(),
-                                result.savings_percent
-                            ),
-                            actual: format!(
-                                "{}→{} lines (may be too aggressive)",
-                                result.original_lines, result.filtered_lines
-                            ),
-                            input_snippet: truncate_for_log(command, 200),
-                            context: format!(
-                                "output_preview: {}",
-                                truncate_for_log(&result.output, 200)
-                            ),
-                            user_feedback: None,
-                        });
-                    }
+                    crate::core::mismatch::log_event(&MismatchEvent {
+                        category: MismatchCategory::OutputFilter,
+                        severity: MismatchSeverity::Warn,
+                        detected: format!(
+                            "filter={}, savings={:.1}%",
+                            filter.name(),
+                            result.savings_percent
+                        ),
+                        actual: format!(
+                            "{}→{} lines (may be too aggressive)",
+                            result.original_lines, result.filtered_lines
+                        ),
+                        input_snippet: truncate_for_log(command, 200),
+                        context: format!(
+                            "output_preview: {}",
+                            truncate_for_log(&result.output, 200)
+                        ),
+                        user_feedback: None,
+                    });
                 }
 
                 return result;
@@ -92,13 +90,11 @@ impl FilterRegistry {
         // No filter matched — record signal for gap analysis
         let output_lines = output.lines().count();
         if output_lines > 20 {
-            if let Ok(tracker) = MismatchTracker::open(None) {
-                let _ = tracker.record_signal(
-                    "no_filter_match",
-                    command,
-                    &format!("{{\"output_lines\": {}}}", output_lines),
-                );
-            }
+            crate::core::mismatch::log_signal(
+                "no_filter_match",
+                command,
+                &format!("{{\"output_lines\": {}}}", output_lines),
+            );
         }
 
         FilterResult::passthrough(output.to_string())
@@ -121,13 +117,11 @@ impl FilterRegistry {
             .count();
 
         if retry_count > 0 {
-            if let Ok(tracker) = MismatchTracker::open(None) {
-                let _ = tracker.record_signal(
-                    "retry_same_command",
-                    command,
-                    &format!("{{\"retry_count\": {}}}", retry_count),
-                );
-            }
+            crate::core::mismatch::log_signal(
+                "retry_same_command",
+                command,
+                &format!("{{\"retry_count\": {}}}", retry_count),
+            );
         }
 
         self.apply(command, output, config)
