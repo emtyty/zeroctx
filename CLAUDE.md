@@ -63,6 +63,28 @@ Use this when the user asks for a report or export of tracking data.
 zero config
 ```
 
+### Check mismatch/quality report
+
+```bash
+zero mismatch                                  # Full report (last 30 days)
+zero mismatch --days 7                         # Last 7 days
+zero mismatch --category autofix --limit 10    # Drill into auto-fix issues
+zero mismatch --category intent_routing        # Drill into routing issues
+zero mismatch --category output_filter         # Drill into filter issues
+zero mismatch --category compression           # Drill into compression issues
+zero mismatch --json                           # Export as JSON
+```
+
+Use this when the user asks about quality, accuracy, mismatches, or wants to improve ZeroCTX's behavior.
+
+### Submit feedback on a mismatch
+
+```bash
+zero feedback <EVENT_ID> "description of what went wrong"
+```
+
+Use this when the user reports that ZeroCTX made a wrong decision (wrong intent, over-filtered output, failed auto-fix, etc.).
+
 ## Error Auto-Fix
 
 ZeroCTX has 62 error patterns that auto-fix common errors WITHOUT needing your reasoning. When you run a command through `zero rewrite-exec --` and it fails:
@@ -79,4 +101,5 @@ If the auto-fix succeeds, just report it to the user and rerun the original comm
 - `zero` is at: `zero.exe` (on PATH)
 - `jq` is required for hooks (also on PATH)
 - Token savings are tracked in SQLite at `~/.zeroctx/tracking.db` (Windows: `%APPDATA%\zeroctx\tracking.db`)
+- Mismatch/quality data is tracked at `~/.local/share/zeroctx/mismatch.db`
 - Configuration: `.zeroctx/config.toml` (project) or `~/.zeroctx/config.toml` (global)

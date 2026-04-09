@@ -139,6 +139,36 @@ pub enum Commands {
     /// Show version information
     Version,
 
+    /// Show mismatch/quality report
+    Mismatch {
+        /// Number of days to include (default 30)
+        #[arg(long, default_value = "30")]
+        days: u32,
+
+        /// Filter by category: intent_routing, output_filter, autofix, compression, language_detection, command_rewrite
+        #[arg(long)]
+        category: Option<String>,
+
+        /// Max events to show (when filtering by category)
+        #[arg(long, default_value = "20")]
+        limit: usize,
+
+        /// Export as JSON instead of human-readable
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Submit feedback on a mismatch event
+    Feedback {
+        /// Mismatch event ID (shown in mismatch report as #N)
+        #[arg(value_name = "EVENT_ID")]
+        event_id: i64,
+
+        /// Your feedback message
+        #[arg(value_name = "MESSAGE")]
+        message: String,
+    },
+
     /// Compress web page HTML to clean text (used by WebFetch hook)
     #[command(name = "compress-web")]
     CompressWeb {
@@ -199,7 +229,10 @@ impl Cli {
                         .unwrap_or_else(|_| ".".into());
                     if let Some(fix) = crate::errors::classify(&output.stderr, &output.stdout, &cwd) {
                         if fix.fixable && config.autofix.auto_run {
-                            if let Ok(result) = crate::errors::execute_fix(&fix) {
+                            // Use verify variant to track auto-fix quality
+                            if let Ok(result) = crate::errors::execute_fix_and_verify(
+                                &fix, &command, &output.stderr,
+                            ) {
                                 eprintln!("{}", result);
                             }
                         } else {
@@ -211,7 +244,7 @@ impl Cli {
                 // Track savings
                 let input_tokens = crate::core::runner::estimate_tokens(&output.stdout);
                 let output_tokens = crate::core::runner::estimate_tokens(&filtered.output);
-                let savings_pct = if input_tokens > 0 {
+                let savings_pct = if input_tokens > 0 && input_tokens > output_tokens {
                     ((input_tokens - output_tokens) as f64 / input_tokens as f64 * 100.0) as i32
                 } else {
                     0
@@ -267,6 +300,16 @@ impl Cli {
                                 }
                             }
                         }
+
+                        // Track repeated reads of the same file (potential compression mismatch)
+                        if let Ok(mismatch_tracker) = crate::core::mismatch::MismatchTracker::open(None) {
+                            let _ = mismatch_tracker.record_signal(
+                                "file_read",
+                                &format!("read {}", path),
+                                &format!("{{\"path\": \"{}\"}}", path),
+                            );
+                        }
+
                         print!("{}", temp_path);
                         std::process::exit(0);
                     }
@@ -326,6 +369,86 @@ impl Cli {
             }
             Some(Commands::Version) => {
                 println!("zeroctx {}", env!("CARGO_PKG_VERSION"));
+                Ok(())
+            }
+            Some(Commands::Mismatch { days, category, limit, json }) => {
+                let tracker = crate::core::mismatch::MismatchTracker::open(None)?;
+
+                if let Some(cat) = category {
+                    // Show events for a specific category
+                    let events = tracker.get_events_by_category(&cat, limit)?;
+                    if json {
+                        let items: Vec<serde_json::Value> = events.iter().map(|e| {
+                            serde_json::json!({
+                                "id": e.id,
+                                "timestamp": e.timestamp,
+                                "category": e.category,
+                                "severity": e.severity,
+                                "detected": e.detected,
+                                "actual": e.actual,
+                                "input_snippet": e.input_snippet,
+                                "context": e.context,
+                            })
+                        }).collect();
+                        println!("{}", serde_json::to_string_pretty(&items)?);
+                    } else {
+                        println!("=== Mismatch Events: {} (last {} days) ===\n", cat, days);
+                        if events.is_empty() {
+                            println!("  No events found for category '{}'.", cat);
+                        }
+                        for e in &events {
+                            let sev = match e.severity.as_str() {
+                                "error" => "ERR",
+                                "warn" => "WRN",
+                                _ => "INF",
+                            };
+                            println!("  [{}] #{} {}", sev, e.id, e.timestamp);
+                            println!("       Detected: {}", e.detected);
+                            if !e.actual.is_empty() {
+                                println!("       Actual:   {}", e.actual);
+                            }
+                            if !e.input_snippet.is_empty() {
+                                println!("       Input:    {}", &e.input_snippet.chars().take(100).collect::<String>());
+                            }
+                            if !e.context.is_empty() {
+                                println!("       Context:  {}", &e.context.chars().take(100).collect::<String>());
+                            }
+                            println!();
+                        }
+                        println!("Tip: Use `zero feedback <ID> \"your message\"` to annotate events.");
+                    }
+                } else {
+                    // Show full report
+                    let report = tracker.get_report(days)?;
+                    if json {
+                        let j = serde_json::json!({
+                            "days": report.days,
+                            "total_events": report.total_events,
+                            "total_signals": report.total_signals,
+                            "categories": report.categories.iter().map(|c| serde_json::json!({
+                                "category": c.category,
+                                "severity": c.severity,
+                                "count": c.count,
+                                "examples": c.examples,
+                            })).collect::<Vec<_>>(),
+                            "signals": report.signals.iter().map(|s| serde_json::json!({
+                                "signal_type": s.signal_type,
+                                "count": s.count,
+                                "operations": s.operations,
+                            })).collect::<Vec<_>>(),
+                            "unresolved_count": report.unresolved.len(),
+                        });
+                        println!("{}", serde_json::to_string_pretty(&j)?);
+                    } else {
+                        print!("{}", crate::core::mismatch::format_report(&report));
+                    }
+                }
+                Ok(())
+            }
+            Some(Commands::Feedback { event_id, message }) => {
+                let tracker = crate::core::mismatch::MismatchTracker::open(None)?;
+                tracker.add_feedback(event_id, &message)?;
+                println!("Feedback recorded for event #{}. Marked as resolved.", event_id);
                 Ok(())
             }
             None => {

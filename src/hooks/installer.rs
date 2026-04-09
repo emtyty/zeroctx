@@ -48,7 +48,7 @@ pub fn install_with_options(project: bool) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&bash_hook_path, perms)?;
+        std::fs::set_permissions(&bash_hook_path, perms.clone())?;
         std::fs::set_permissions(&read_hook_path, perms)?;
     }
 
