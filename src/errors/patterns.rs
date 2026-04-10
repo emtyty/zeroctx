@@ -4,6 +4,26 @@ use std::collections::HashMap;
 
 use crate::core::types::{AutoFix, Language};
 
+/// Detect the available pip command: `pip3`, `pip`, or `python3 -m pip`.
+fn pip_command() -> &'static str {
+    static PIP_CMD: Lazy<&str> = Lazy::new(|| {
+        for candidate in &["pip3", "pip"] {
+            if std::process::Command::new(candidate)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                return candidate;
+            }
+        }
+        "python3 -m pip"
+    });
+    &PIP_CMD
+}
+
 /// A compiled error pattern with its handler.
 pub struct ErrorPattern {
     pub regex: Regex,
@@ -64,7 +84,7 @@ fn python_patterns() -> Vec<ErrorPattern> {
                     fixable: true,
                     category: "python_module_not_found".into(),
                     explanation: format!("Module '{}' not installed", module),
-                    command: Some(format!("pip install {}", package)),
+                    command: Some(format!("{} install --disable-pip-version-check {}", pip_command(), package)),
                     language: Language::Python,
                 }
             },
