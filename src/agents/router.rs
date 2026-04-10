@@ -2,6 +2,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use std::path::PathBuf;
 
+use crate::core::mismatch::{MismatchCategory, MismatchEvent, MismatchSeverity};
 use crate::core::types::{Intent, ParsedRequest, SubTask};
 
 /// Regex-based intent router — zero token cost.
@@ -42,8 +43,13 @@ impl IntentRouter {
             .map(|m| m.as_str().trim().to_string())
             .collect();
 
-        // Detect intent from signals
-        let intent = Self::classify_intent(&lower, &urls, &commands, &files);
+        // Detect intent from signals + check for ambiguity
+        let (intent, confidence) = Self::classify_intent_with_confidence(&lower, &urls, &commands, &files);
+
+        // Log mismatch if confidence is low (ambiguous signals)
+        if confidence.competing_intents.len() > 1 {
+            Self::log_ambiguous_routing(request, &intent, &confidence);
+        }
 
         ParsedRequest {
             raw: request.to_string(),
@@ -62,6 +68,17 @@ impl IntentRouter {
         commands: &[String],
         files: &[PathBuf],
     ) -> Intent {
+        Self::classify_intent_with_confidence(lower, urls, commands, files).0
+    }
+
+    fn classify_intent_with_confidence(
+        lower: &str,
+        urls: &[String],
+        commands: &[String],
+        files: &[PathBuf],
+    ) -> (Intent, IntentConfidence) {
+        let mut competing = Vec::new();
+
         // Multi-step detection
         let multi_step_signals = ["then", "and then", "after that", "first", "second", "finally"];
         let step_count = multi_step_signals
@@ -69,42 +86,120 @@ impl IntentRouter {
             .filter(|s| lower.contains(**s))
             .count();
         if step_count >= 2 {
-            return Intent::MultiStep;
+            competing.push(("MultiStep", step_count as f64 * 0.4));
         }
 
-        // Fetch + Analyze
-        if !urls.is_empty()
+        // Fetch + Analyze signals
+        let fetch_signals = ["fetch", "read", "summarize", "analyze"];
+        let fetch_score: f64 = if !urls.is_empty() {
+            fetch_signals.iter().filter(|s| lower.contains(**s)).count() as f64 * 0.3 + 0.3
+        } else {
+            0.0
+        };
+        if fetch_score > 0.0 {
+            competing.push(("FetchAndAnalyze", fetch_score));
+        }
+
+        // Clone + Explore
+        if lower.contains("clone") || lower.contains("repo") {
+            competing.push(("CloneAndExplore", 0.7));
+        }
+
+        // Run + Debug signals
+        let run_signals = [
+            "run", "test", "build", "execute", "debug", "fix", "pytest", "cargo",
+            "npm", "dotnet", "make",
+        ];
+        let run_score: f64 = run_signals.iter().filter(|s| lower.contains(**s)).count() as f64 * 0.2
+            + if !commands.is_empty() { 0.3 } else { 0.0 };
+        if run_score > 0.0 {
+            competing.push(("RunAndDebug", run_score));
+        }
+
+        // Read + Refactor signals
+        let read_signals = ["read", "refactor", "rename", "move", "extract", "explain"];
+        let read_score: f64 = if !files.is_empty() {
+            read_signals.iter().filter(|s| lower.contains(**s)).count() as f64 * 0.25
+        } else {
+            0.0
+        };
+        if read_score > 0.0 {
+            competing.push(("ReadAndRefactor", read_score));
+        }
+
+        // Sort by score descending
+        competing.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Pick the winner (same logic as before, but now we have scores)
+        let winner = if step_count >= 2 {
+            Intent::MultiStep
+        } else if !urls.is_empty()
             && (lower.contains("fetch")
                 || lower.contains("read")
                 || lower.contains("summarize")
                 || lower.contains("analyze"))
         {
-            return Intent::FetchAndAnalyze;
-        }
+            Intent::FetchAndAnalyze
+        } else if lower.contains("clone") || lower.contains("repo") {
+            Intent::CloneAndExplore
+        } else if run_signals.iter().any(|s| lower.contains(s)) || !commands.is_empty() {
+            Intent::RunAndDebug
+        } else if (read_signals.iter().any(|s| lower.contains(s))) && !files.is_empty() {
+            Intent::ReadAndRefactor
+        } else {
+            Intent::CodeOnly
+        };
 
-        // Clone + Explore
-        if lower.contains("clone") || lower.contains("repo") {
-            return Intent::CloneAndExplore;
-        }
+        let confidence = IntentConfidence {
+            competing_intents: competing,
+        };
 
-        // Run + Debug
-        let run_signals = [
-            "run", "test", "build", "execute", "debug", "fix", "pytest", "cargo",
-            "npm", "dotnet", "make",
-        ];
-        if run_signals.iter().any(|s| lower.contains(s)) || !commands.is_empty() {
-            return Intent::RunAndDebug;
-        }
-
-        // Read + Refactor
-        let read_signals = ["read", "refactor", "rename", "move", "extract", "explain"];
-        if (read_signals.iter().any(|s| lower.contains(s))) && !files.is_empty() {
-            return Intent::ReadAndRefactor;
-        }
-
-        // Default: code only
-        Intent::CodeOnly
+        (winner, confidence)
     }
+
+    fn log_ambiguous_routing(request: &str, chosen: &Intent, confidence: &IntentConfidence) {
+        let competing_str: Vec<String> = confidence
+            .competing_intents
+            .iter()
+            .map(|(name, score)| format!("{}({:.2})", name, score))
+            .collect();
+
+        // Only log if there are genuinely close scores (ambiguity)
+        if confidence.competing_intents.len() >= 2 {
+            let top = confidence.competing_intents[0].1;
+            let second = confidence.competing_intents[1].1;
+            // If the gap between top two is small, it's ambiguous
+            if (top - second).abs() < 0.2 {
+                let severity = if (top - second).abs() < 0.1 {
+                    MismatchSeverity::Warn
+                } else {
+                    MismatchSeverity::Info
+                };
+
+                crate::core::mismatch::log_event(&MismatchEvent {
+                    category: MismatchCategory::IntentRouting,
+                    severity,
+                    detected: format!("{:?}", chosen),
+                    actual: String::new(),
+                    input_snippet: request.to_string(),
+                    context: format!("competing: [{}]", competing_str.join(", ")),
+                    user_feedback: None,
+                });
+
+                tracing::debug!(
+                    chosen = ?chosen,
+                    competing = %competing_str.join(", "),
+                    "Ambiguous intent routing"
+                );
+            }
+        }
+    }
+}
+
+/// Confidence information for intent classification.
+struct IntentConfidence {
+    /// (intent_name, score) pairs, sorted by score descending.
+    competing_intents: Vec<(&'static str, f64)>,
 }
 
 /// Split multi-step requests into atomic sub-tasks.
