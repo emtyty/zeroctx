@@ -50,8 +50,10 @@ pub fn compress_file(path: &str, _config: &Config) -> Result<String> {
                 0
             };
 
-            // Track extreme compression as potential mismatch
-            if savings_pct > 95 && line_count > 200 {
+            // Fallback to basic compression when tree-sitter is too aggressive:
+            // >90% savings on large files (>200 lines) likely loses important body content
+            // e.g. patterns.rs: 1042->15 lines drops all regex content inside fn bodies
+            if savings_pct > 90 && line_count > 200 {
                 crate::core::mismatch::log_event(&MismatchEvent {
                     category: MismatchCategory::Compression,
                     severity: MismatchSeverity::Info,
@@ -60,7 +62,7 @@ pub fn compress_file(path: &str, _config: &Config) -> Result<String> {
                         lang, savings_pct
                     ),
                     actual: format!(
-                        "{}→{} lines (may lose important context)",
+                        "{}→{} lines (fallback to basic_compress)",
                         line_count,
                         compressed.lines().count()
                     ),
@@ -68,6 +70,16 @@ pub fn compress_file(path: &str, _config: &Config) -> Result<String> {
                     context: format!("method=tree_sitter, original_lines={}", line_count),
                     user_feedback: None,
                 });
+                let basic = basic_compress(&content);
+                let basic_lines = basic.lines().count();
+                let hdr = format!(
+                    "// [ZeroCTX compressed: {} → {} lines, basic mode]
+// Full file: {}
+
+",
+                    line_count, basic_lines, path,
+                );
+                return Ok(format!("{}{}", hdr, basic));
             }
 
             let header = format!(

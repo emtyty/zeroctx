@@ -1,4 +1,5 @@
 /target
+.claude/settings.json
 *.exe
 *.dll
 *.so
