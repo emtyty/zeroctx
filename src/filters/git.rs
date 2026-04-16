@@ -25,6 +25,8 @@ impl OutputFilter for GitFilter {
             // Detect subcommand from output patterns
             if is_diff_output(output) {
                 filter_diff(output, config)
+            } else if is_show_stat_output(output) {
+                filter_show_stat(output, config)
             } else if is_log_output(output) {
                 filter_log(output, config)
             } else if is_status_output(output) {
@@ -59,6 +61,20 @@ fn is_diff_output(output: &str) -> bool {
 
 fn is_log_output(output: &str) -> bool {
     output.starts_with("commit ") || output.contains("\ncommit ")
+}
+
+fn is_show_stat_output(output: &str) -> bool {
+    // git show --stat: has commit header AND file stat lines (file | N +/-)
+    static STAT_LINE_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"(?m)^\s+\S+.*\|\s+\d+").expect("valid regex"));
+    is_log_output(output) && STAT_LINE_RE.is_match(output)
+}
+
+fn filter_show_stat(output: &str, config: &Config) -> String {
+    // git show --stat: preserve commit info + file stat summary
+    // Short outputs: pass through entirely; long outputs: truncate
+    let max_lines = config.limits.git_status_max_files * 3;
+    truncate_output(output, max_lines.max(50))
 }
 
 fn is_status_output(output: &str) -> bool {

@@ -51,9 +51,12 @@ pub fn compress_file(path: &str, _config: &Config) -> Result<String> {
             };
 
             // Fallback to basic compression when tree-sitter is too aggressive:
-            // >90% savings on large files (>200 lines) likely loses important body content
-            // e.g. patterns.rs: 1042->15 lines drops all regex content inside fn bodies
-            if savings_pct > 90 && line_count > 200 {
+            // Two checks: (1) >90% savings on large files, or
+            // (2) fewer than 15 output lines from a 200+ line file (always too little structure)
+            let compressed_lines = compressed.lines().count();
+            if (savings_pct > 90 && line_count > 200)
+                || (line_count > 200 && compressed_lines < 15)
+            {
                 crate::core::mismatch::log_event(&MismatchEvent {
                     category: MismatchCategory::Compression,
                     severity: MismatchSeverity::Info,

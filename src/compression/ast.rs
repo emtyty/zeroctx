@@ -79,6 +79,25 @@ impl AstCompressor {
                 return;
             }
         }
+        // JS/TS: handle test framework call patterns (describe, it, test, etc.)
+        // These are expression_statement nodes with call_expression children,
+        // not captured by is_definition_node but critical for test file structure.
+        if matches!(language, Language::JavaScript | Language::TypeScript)
+            && node.kind() == "expression_statement"
+        {
+            if let Some((sig, body_node)) = Self::js_test_call_signature(node, source) {
+                let indent = "  ".repeat(depth);
+                out.push(format!("{}{}", indent, sig));
+                if let Some(block) = body_node {
+                    let mut cursor = block.walk();
+                    for child in block.children(&mut cursor) {
+                        Self::collect_signatures(child, source, language, depth + 1, out);
+                    }
+                }
+                return;
+            }
+        }
+
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             Self::collect_signatures(child, source, language, depth, out);
@@ -225,6 +244,76 @@ impl AstCompressor {
             }
             _ => String::new(),
         }
+    }
+
+    /// Extract signature from JS/TS test framework call expressions.
+    /// Handles: describe('name', () => {}), it('name', () => {}), test('name', fn), etc.
+    /// Returns (signature_string, optional_body_node_for_recursion).
+    fn js_test_call_signature<'a>(
+        node: Node<'a>,
+        source: &str,
+    ) -> Option<(String, Option<Node<'a>>)> {
+        let call = node.child(0)?;
+        if call.kind() != "call_expression" {
+            return None;
+        }
+
+        let func = call.child(0)?;
+        let name = func.utf8_text(source.as_bytes()).ok()?;
+
+        // Known test framework call names
+        let is_container_call = matches!(name, "describe" | "context" | "suite" | "fdescribe" | "xdescribe");
+        let is_test_call = matches!(
+            name,
+            "it" | "test" | "specify" | "fit" | "xit" | "xtest"
+                | "beforeEach" | "afterEach" | "beforeAll" | "afterAll"
+                | "before" | "after"
+        );
+
+        if !is_container_call && !is_test_call {
+            return None;
+        }
+
+        let args = call.child_by_field_name("arguments")?;
+
+        // Walk arguments to find test name (string) and callback body
+        let mut test_name = None;
+        let mut callback_body = None;
+        let mut cursor = args.walk();
+        for child in args.children(&mut cursor) {
+            match child.kind() {
+                "string" | "template_string" => {
+                    if test_name.is_none() {
+                        test_name =
+                            child.utf8_text(source.as_bytes()).ok().map(|s| s.to_string());
+                    }
+                }
+                "arrow_function" | "function_expression" => {
+                    let mut inner_cursor = child.walk();
+                    for inner_child in child.children(&mut inner_cursor) {
+                        if inner_child.kind() == "statement_block" {
+                            callback_body = Some(inner_child);
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let sig = match test_name {
+            Some(ref tname) => format!("{}({}, () => {{ ... }})", name, tname),
+            None => format!("{}(() => {{ ... }})", name),
+        };
+
+        // Only recurse into container calls (describe, context, suite)
+        let body_for_recursion = if is_container_call {
+            callback_body
+        } else {
+            None
+        };
+
+        Some((sig, body_for_recursion))
     }
 
     fn csharp_signature(node: Node, source: &str) -> String {
