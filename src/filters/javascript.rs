@@ -48,25 +48,36 @@ impl OutputFilter for JavaScriptFilter {
     }
 }
 
-/// Jest/Vitest: extract FAIL suites + first assertion error, skip PASS
+/// Jest/Vitest: extract FAIL suites + first assertion error, skip PASS details.
+/// Also deduplicates console warnings from node_modules into a compact summary.
 fn filter_test_runner(output: &str) -> String {
+    use std::collections::HashMap;
+
     let mut result = Vec::new();
     let mut in_failure = false;
     let mut failure_lines = 0;
     let max_failure_lines = 10;
     let has_failures = output.contains("FAIL ") || output.contains("FAILED");
 
+    // Collect console warnings from node_modules for deduplication
+    let mut console_warnings: HashMap<String, usize> = HashMap::new();
+
     for line in output.lines() {
         let trimmed = line.trim();
 
         // Summary lines (always keep)
-        if trimmed.starts_with("Tests:") || trimmed.starts_with("Test Suites:") || trimmed.starts_with("Time:") || trimmed.starts_with("Ran all") {
+        if trimmed.starts_with("Tests:") || trimmed.starts_with("Test Suites:")
+            || trimmed.starts_with("Time:") || trimmed.starts_with("Ran all")
+        {
             result.push(line.to_string());
             continue;
         }
 
-        // PASS lines — skip if there are failures
-        if trimmed.starts_with("PASS ") && has_failures {
+        // PASS lines — keep when all pass, skip when there are failures
+        if trimmed.starts_with("PASS ") {
+            if !has_failures {
+                result.push(line.to_string());
+            }
             continue;
         }
 
@@ -79,10 +90,31 @@ fn filter_test_runner(output: &str) -> String {
         }
 
         // Failure assertion lines
-        if trimmed.starts_with("●") || trimmed.starts_with("✕") || trimmed.starts_with("✗") || trimmed.starts_with("×") {
+        if trimmed.starts_with("●") || trimmed.starts_with("✕")
+            || trimmed.starts_with("✗") || trimmed.starts_with("×")
+        {
             result.push(line.to_string());
             in_failure = true;
             failure_lines = 0;
+            continue;
+        }
+
+        // Console warnings/errors from application code (keep)
+        if trimmed.starts_with("console.error") || trimmed.starts_with("console.warn") {
+            result.push(line.to_string());
+            continue;
+        }
+
+        // Deduplicate node_modules warning stacktrace lines
+        if trimmed.contains("node_modules/") {
+            if let Some(nm_pos) = trimmed.find("node_modules/") {
+                let module_ref = &trimmed[nm_pos..];
+                let pkg = module_ref
+                    .strip_prefix("node_modules/")
+                    .and_then(|s| s.split('/').next())
+                    .unwrap_or("unknown");
+                *console_warnings.entry(pkg.to_string()).or_insert(0) += 1;
+            }
             continue;
         }
 
@@ -97,6 +129,17 @@ fn filter_test_runner(output: &str) -> String {
                 }
                 in_failure = false;
             }
+        }
+    }
+
+    // Append deduplicated console warning summary
+    if !console_warnings.is_empty() {
+        let total: usize = console_warnings.values().sum();
+        let mut warnings: Vec<(String, usize)> = console_warnings.into_iter().collect();
+        warnings.sort_by(|a, b| b.1.cmp(&a.1));
+        result.push(format!("  [console warnings: {} from node_modules]", total));
+        for (pkg, count) in &warnings {
+            result.push(format!("    {} (x{})", pkg, count));
         }
     }
 
