@@ -6,7 +6,7 @@ use regex::Regex;
 pub fn extract_diffs(response: &str) -> Vec<DiffBlock> {
     static DIFF_HEADER: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"^---\s+a/(.+)$").expect("valid regex"));
-    static HUNK_HEADER: Lazy<Regex> =
+    static _HUNK_HEADER: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"^@@\s+-(\d+),?(\d*)\s+\+(\d+),?(\d*)\s+@@").expect("valid regex"));
 
     let mut diffs = Vec::new();

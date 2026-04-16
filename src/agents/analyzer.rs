@@ -26,7 +26,7 @@ pub fn analyze(
 
     // Step 1: Check for auto-fixable errors in command outputs
     if config.autofix.enabled {
-        for (cmd, stdout, stderr, exit_code) in &io.command_outputs {
+        for (_cmd, stdout, stderr, exit_code) in &io.command_outputs {
             if *exit_code != 0 {
                 if let Some(fix) = errors::classify(stderr, stdout, &cwd) {
                     if fix.fixable && config.autofix.auto_run {

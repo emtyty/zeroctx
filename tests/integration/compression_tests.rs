@@ -2,7 +2,6 @@ use zeroctx::compression::ast::AstCompressor;
 use zeroctx::compression::compress_file;
 use zeroctx::config::Config;
 use zeroctx::core::types::Language;
-use std::path::Path;
 
 fn fixtures_dir() -> String {
     let manifest = env!("CARGO_MANIFEST_DIR");

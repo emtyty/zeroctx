@@ -93,7 +93,7 @@ fn is_status_output(output: &str) -> bool {
 fn filter_diff(output: &str, config: &Config) -> String {
     let max_hunk_lines = config.limits.git_diff_max_hunk_lines;
     let mut result = Vec::new();
-    let mut current_file: Option<String> = None;
+    let mut _current_file: Option<String> = None;
     let mut hunk_lines = 0;
     let mut total_additions = 0;
     let mut total_deletions = 0;
@@ -108,7 +108,7 @@ fn filter_diff(output: &str, config: &Config) -> String {
                 result.push(format!("  ... ({} more lines in hunk)", hunk_lines - max_hunk_lines));
             }
             files_changed += 1;
-            current_file = line.split(" b/").nth(1).map(|s| s.to_string());
+            _current_file = line.split(" b/").nth(1).map(|s| s.to_string());
             hunk_lines = 0;
             in_hunk = false;
             hunk_truncated = false;

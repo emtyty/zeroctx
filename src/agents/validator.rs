@@ -37,7 +37,7 @@ pub fn validate_and_apply(
 
         // Apply the diff
         match diff.apply() {
-            Ok(msg) => {
+            Ok(_msg) => {
                 // Validate the patched file
                 let ext = Path::new(&diff.file_path)
                     .extension()

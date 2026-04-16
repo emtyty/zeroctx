@@ -215,7 +215,7 @@ fn render_markdown(md: &str) -> String {
     let mut code_lang = String::new();
     let mut code_buf = String::new();
     let mut in_table = false;
-    let mut table_header_done = false;
+    let mut _table_header_done = false;
     let mut in_list = false;
     let mut list_type = "ul";
 
@@ -248,7 +248,7 @@ fn render_markdown(md: &str) -> String {
         if in_table && !trimmed.starts_with('|') {
             html.push_str("</tbody></table>\n");
             in_table = false;
-            table_header_done = false;
+            _table_header_done = false;
         }
 
         // Close list if non-list line
@@ -302,7 +302,7 @@ fn render_markdown(md: &str) -> String {
         if trimmed.starts_with('|') && trimmed.ends_with('|') {
             // Skip separator rows (|---|---|)
             if trimmed.contains("---") {
-                table_header_done = true;
+                _table_header_done = true;
                 continue;
             }
             let cells: Vec<&str> = trimmed

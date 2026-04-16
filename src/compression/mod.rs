@@ -50,9 +50,8 @@ pub fn compress_file(path: &str, _config: &Config) -> Result<String> {
                 0
             };
 
-            // Fallback to basic compression when tree-sitter is too aggressive:
-            // Two checks: (1) >90% savings on large files, or
-            // (2) fewer than 15 output lines from a 200+ line file (always too little structure)
+            // Fallback to basic_compress when tree-sitter is too aggressive:
+            // (1) >90% savings on large files, or (2) <15 output lines from 200+ line file
             let compressed_lines = compressed.lines().count();
             if (savings_pct > 90 && line_count > 200)
                 || (line_count > 200 && compressed_lines < 15)
@@ -75,14 +74,14 @@ pub fn compress_file(path: &str, _config: &Config) -> Result<String> {
                 });
                 let basic = basic_compress(&content);
                 let basic_lines = basic.lines().count();
-                let hdr = format!(
-                    "// [ZeroCTX compressed: {} → {} lines, basic mode]
-// Full file: {}
-
-",
-                    line_count, basic_lines, path,
+                let header = format!(
+                    "// [ZeroCTX compressed: {} → {} lines, ~{}% saved]\n// Full file: {}\n\n",
+                    line_count,
+                    basic_lines,
+                    if line_count > 0 { (line_count - basic_lines) * 100 / line_count } else { 0 },
+                    path,
                 );
-                return Ok(format!("{}{}", hdr, basic));
+                return Ok(format!("{}{}", header, basic));
             }
 
             let header = format!(
