@@ -1,6 +1,6 @@
 [package]
 name = "zeroctx"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Agent team that reduces AI coding assistant token usage by 40-60%"
 license = "MIT"
