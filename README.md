@@ -513,4 +513,18 @@ ZeroCTX was inspired by [RTK](https://github.com/rtk-ai/rtk) but addresses its l
 
 ## License
 
-MIT
+ZeroCTX is distributed under a **Dual-Use License** (see [LICENSE](LICENSE) for the full text).
+
+**Non-commercial use is free** — personal, academic, and research use are permitted at no cost, subject to retaining the copyright notice. You may use, copy, modify, and distribute ZeroCTX for any non-revenue-generating purpose.
+
+**Commercial use requires a paid license.** This includes use within for-profit organizations, integration into paid products or services, internal tooling that supports revenue-generating operations, and SaaS/consulting/agency deployments.
+
+| Tier | Price | Scope |
+|------|-------|-------|
+| Builder | $79 | 1 developer |
+| Studio | $349 | Up to 5 developers |
+| Platform | $1,999 | Org-wide internal deployment |
+
+For commercial licensing, open an issue at the repository.
+
+Copyright (c) 2026 ZeroCTX authors.
