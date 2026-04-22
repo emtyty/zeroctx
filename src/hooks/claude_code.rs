@@ -101,8 +101,21 @@ pub fn handle_read(input: &HookInput) -> Result<Option<HookOutput>> {
     }
 
     let config = crate::config::Config::load()?;
+
+    // Inject project brief on first file read in this session (flag via temp file)
+    let brief_injected = should_inject_brief();
+
     match crate::compression::compress_to_temp(file_path, &config) {
         Ok(temp_path) => {
+            // If brief should be injected, prepend it to the compressed file
+            if brief_injected {
+                if let Some(brief) = crate::compression::load_project_brief() {
+                    if let Ok(compressed) = std::fs::read_to_string(&temp_path) {
+                        let combined = format!("{}{}", brief, compressed);
+                        std::fs::write(&temp_path, combined).ok();
+                    }
+                }
+            }
             let mut updated = input.tool_input.clone();
             updated["file_path"] = serde_json::Value::String(temp_path);
             Ok(Some(HookOutput::allow(
@@ -112,4 +125,49 @@ pub fn handle_read(input: &HookInput) -> Result<Option<HookOutput>> {
         }
         Err(_) => Ok(None),
     }
+}
+
+/// Returns true (and marks the session) if the brief has not yet been injected today.
+/// Uses a temp flag file to avoid injecting on every read.
+fn should_inject_brief() -> bool {
+    let today = chrono::Local::now().format("%Y%m%d").to_string();
+    let flag_path = std::env::temp_dir().join(format!("zeroctx_brief_{}.flag", today));
+    if flag_path.exists() {
+        return false;
+    }
+    // Create flag file — this session gets the brief injected once
+    std::fs::write(&flag_path, "").ok();
+    true
+}
+
+/// Handle PostToolUse hook for Glob tool — compress file listing results.
+pub fn handle_post_glob(tool_output: &str) -> String {
+    crate::filters::system::compress_glob_results(tool_output)
+}
+
+/// Handle PostToolUse hook for Grep tool — compress search results.
+pub fn handle_post_grep(tool_output: &str) -> String {
+    crate::filters::system::compress_grep_results(tool_output)
+}
+
+/// Build a PostToolUse hook JSON response that replaces the tool output.
+/// Claude Code PostToolUse protocol: return JSON with decision+reason to replace output.
+pub fn post_tool_response(compressed: &str, original_len: usize, compressed_len: usize) -> String {
+    let savings = if original_len > 0 && original_len > compressed_len {
+        (original_len - compressed_len) * 100 / original_len
+    } else {
+        0
+    };
+    let reason = format!(
+        "{}\n\n[ZeroCTX: {} → {} chars, ~{}% saved]",
+        compressed, original_len, compressed_len, savings
+    );
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "decision": "block",
+            "reason": reason
+        }
+    })
+    .to_string()
 }

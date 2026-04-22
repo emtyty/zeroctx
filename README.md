@@ -1,4 +1,4 @@
-# ZeroCTX
+# ZeroCTX v0.3
 
 A Rust-based agent team that reduces AI coding assistant token usage by 40-60% and saves 15-25% of session time.
 
@@ -97,13 +97,26 @@ Every command output is compressed before reaching the LLM:
 
 | Category | Commands | Typical Savings |
 |----------|----------|----------------|
-| **Git** | status, diff, log, show, branch, gh | 60-80% |
+| **Git** | status, diff, log, show, branch, gh | 60-80% (large diffs: bar-chart stat view, see below) |
 | **Python** | pytest, ruff, mypy, pip | 70-90% |
 | **JavaScript** | eslint, tsc, jest, vitest, npm, next, playwright | 70-90% |
 | **.NET** | dotnet build, dotnet test, nuget, format | 60-85% |
 | **Rust** | cargo build, cargo test, cargo clippy | 80-90% |
 | **System** | ls, tree, grep, find, cat, wc, env, logs | 50-75% |
 | **Network** | curl, wget | 60-70% |
+| **Glob + Grep** | Claude Code Glob/Grep tool calls | 80-95% |
+
+**Smart Large-Diff Auto-Stat (v0.3):** When a `git diff` produces more than 300 changed lines (lines starting with `+` or `-`), ZeroCTX switches to a stat bar-chart view and includes full content only for the 3 most-changed files:
+
+```
+ src/filters/git.rs        | ████████████████  87 ++/31 --
+ src/analyzer/context.rs   | ████████████  61 ++/14 --
+ src/agents/build.rs       | ████████  44 ++/9 --
+ tests/integration_test.rs | ██  12 ++/3 --
+ ... 7 more files (142 ++/38 -- total)
+
+[Full diff shown for: src/filters/git.rs, src/analyzer/context.rs, src/agents/build.rs]
+```
 
 ### Error Auto-Fix (60+ patterns, 100% savings when matched)
 
@@ -137,14 +150,43 @@ Savings: 98%
 
 Uses [tree-sitter](https://tree-sitter.github.io/) for accurate AST parsing across Python, JavaScript/TypeScript, C#, and Rust.
 
-### Context Caching (70%+ savings on round 2+)
+**Error-line-aware extraction (v0.3):** When an error references a specific line (e.g. `src/auth.py line 42`), ZeroCTX extracts the full body of the function containing that line. All other functions remain as signatures only. This is more targeted than uniform signature extraction — you get full context exactly where the error is, and nothing else.
 
-Files are MD5-hashed. On subsequent rounds, unchanged files become one-line summaries:
+### Context Caching (70%+ savings on round 2+, cross-session)
+
+Files are MD5-hashed and the cache is persisted to SQLite (`%APPDATA%\zeroctx\cache.db` on Windows, `~/.zeroctx/cache.db` elsewhere). On subsequent rounds — including across sessions — unchanged files become one-line summaries. Deduplication is mtime-based: if a file's modification time hasn't changed since the last session, the compressed version is returned instantly without re-reading. Cache entries expire after 30 days.
 
 ```
 Round 1: auth.rs (500 lines, full content)       → 1250 tokens
-Round 2: auth.rs (unchanged, summary only)        → 15 tokens
+Round 2: auth.rs (unchanged, summary only)        → 15 tokens  (same session or new session)
 Savings: 99%
+```
+
+### Glob + Grep Output (80-95% savings)
+
+PostToolUse hooks compress the output of Claude Code's `Glob` and `Grep` tool calls before they reach the context window.
+
+**Glob** — groups file paths by directory instead of listing each path separately:
+```
+Before (8 lines):
+  src/filters/git.rs
+  src/filters/python.rs
+  src/filters/javascript.rs
+  ...
+
+After (1 line):
+  src/filters/ (8 files: git.rs, python.rs, javascript.rs, ...)
+```
+
+**Grep** — groups matches by file with inline previews:
+```
+Before (12 lines of raw matches):
+  src/auth.rs:14:  let token = ...
+  src/auth.rs:27:  let token = ...
+  ...
+
+After (1 line):
+  src/auth.rs (12 matches) > let token = ...
 ```
 
 ### Diff-Only Output (90% fewer output tokens)
@@ -156,6 +198,22 @@ Without: Claude outputs entire 200-line file     → 2000 output tokens (5x pric
 With:    Claude outputs 5-line diff patch         → 100 output tokens
 Savings: 95% on output tokens (which cost 5x input tokens)
 ```
+
+## Project Brief
+
+ZeroCTX can inject a compressed project summary at the start of each Claude Code session, saving Claude from re-reading your README, `Cargo.toml`, or `package.json` every time.
+
+Create `.zeroctx/brief.md` (≤200 lines) in your project root. ZeroCTX automatically prepends a compressed version once per day when a Claude Code session starts.
+
+```bash
+# Show the current brief
+zero brief
+
+# Auto-generate a brief from README.md, Cargo.toml, or package.json
+zero brief --generate
+```
+
+The generated brief is a concise summary of project name, purpose, key dependencies, and entry points. Edit it freely — ZeroCTX compresses it further before injection so even a 200-line brief costs very few tokens.
 
 ## Configuration
 
@@ -315,6 +373,8 @@ COMMANDS:
     stats        Show token savings dashboard
     export       Export tracking data (--format json|csv|html|pdf)
     config       Show current configuration
+    brief        Show current project brief (--generate to auto-create from README/Cargo.toml/package.json)
+    session      Show live session cost/savings dashboard (last 24 hours)
     version      Show version information
 
 OPTIONS:
@@ -349,11 +409,34 @@ zero export --format pdf -o report.pdf    # PDF report
 zero export --format csv -o data.csv      # CSV export
 zero export --format json                 # JSON to stdout
 
+# Session monitoring
+zero session                            # Live session cost/savings dashboard
+
+# Project brief
+zero brief                              # Show current brief
+zero brief --generate                   # Auto-generate from README/Cargo.toml/package.json
+
 # Debugging
 zero rewrite "git status"               # Test command rewriting
 zero compress src/auth.rs               # Test file compression
 zero --dry-run "run pytest"             # Show pipeline without executing
 ```
+
+## Session Monitoring
+
+`zero session` shows a live dashboard of the current session's cost and savings, using the last 24 hours of tracking data:
+
+```
+=== ZeroCTX Session (24 hours) ===
+  Started:  2026-04-22 14:07:44
+  Commands: 77
+  Tokens:   ~133K input / ~37K output  ($0.964 est.)
+  Saved:    ~96K tokens (42%) via ZeroCTX  ($0.289 saved)
+  Without:  ~230K tokens would have been used  ($1.253 est.)
+==================================
+```
+
+Token counts are estimated from tracking data. Cost estimates use current Claude Sonnet pricing and update automatically when you upgrade models via `ZEROCTX_MODEL`.
 
 ## Architecture
 
@@ -385,7 +468,7 @@ zero --dry-run "run pytest"             # Show pipeline without executing
                  │  ErrorClassifier (60+ regex)  │
                  │  → auto-fix? DONE (0 tokens)  │
                  │  ASTCompressor (tree-sitter)  │
-                 │  ContextCache (MD5 dedup)     │
+                 │  ContextCache (SQLite, mtime) │
                  │  ContextBuilder (budget)      │
                  │  0 tokens                     │
                  └──────────────┬───────────────┘
@@ -502,7 +585,7 @@ ZeroCTX was inspired by [RTK](https://github.com/rtk-ai/rtk) but addresses its l
 | Output filtering | 60-90% savings | 60-90% (same quality, trait-based) |
 | Error auto-fix | No | 60+ patterns, auto-installs packages |
 | AST compression | Partial (body stripping) | Full (tree-sitter, extracts relevant functions) |
-| Context caching | No | MD5 dedup, 70%+ savings on round 2+ |
+| Context caching | No | MD5 dedup, cross-session SQLite, mtime-based, 70%+ savings on round 2+ |
 | Diff-only output | No | 90% fewer output tokens |
 | Task decomposition | No | Regex-based multi-step splitting |
 | Output validation | No | Per-language syntax + lint checking |

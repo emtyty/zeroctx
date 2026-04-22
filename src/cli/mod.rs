@@ -175,6 +175,31 @@ pub enum Commands {
         /// URL being fetched (for tracking)
         url: String,
     },
+
+    /// Compress tool output (used by PostToolUse hook for Glob/Grep)
+    #[command(name = "compress-output")]
+    CompressOutput {
+        /// Tool name: glob or grep
+        #[arg(long)]
+        tool: String,
+    },
+
+    /// Show session cost estimate
+    Session {
+        /// Hours to include (default 24)
+        #[arg(long, default_value = "24")]
+        hours: u32,
+        /// Watch mode: refresh every 30 seconds
+        #[arg(long)]
+        watch: bool,
+    },
+
+    /// Generate or show project brief (.zeroctx/brief.md)
+    Brief {
+        /// Auto-generate brief from README.md / Cargo.toml / package.json
+        #[arg(long)]
+        generate: bool,
+    },
 }
 
 impl Cli {
@@ -341,6 +366,49 @@ impl Cli {
             Some(Commands::Config) => {
                 let config = crate::config::Config::load()?;
                 println!("{}", toml::to_string_pretty(&config).unwrap_or_default());
+                Ok(())
+            }
+            Some(Commands::CompressOutput { tool }) => {
+                use std::io::Read as _;
+                let mut input = String::new();
+                std::io::stdin().read_to_string(&mut input).unwrap_or(0);
+                let compressed = match tool.to_lowercase().as_str() {
+                    "glob" => crate::hooks::claude_code::handle_post_glob(&input),
+                    "grep" => crate::hooks::claude_code::handle_post_grep(&input),
+                    _ => input.clone(),
+                };
+                let response = crate::hooks::claude_code::post_tool_response(
+                    &compressed,
+                    input.len(),
+                    compressed.len(),
+                );
+                // Only output if we actually compressed
+                if compressed.len() < input.len() {
+                    println!("{}", response);
+                    if let Ok(tracker) = crate::core::tracking::Tracker::open(None) {
+                        let input_tokens = crate::core::runner::estimate_tokens(&input);
+                        let output_tokens = crate::core::runner::estimate_tokens(&compressed);
+                        let _ = tracker.record(
+                            &format!("post_tool_{}", tool),
+                            input_tokens,
+                            output_tokens,
+                            crate::core::types::SavingsMethod::OutputFilter,
+                        );
+                    }
+                    std::process::exit(0);
+                }
+                std::process::exit(0);
+            }
+            Some(Commands::Session { hours, watch }) => {
+                crate::export::print_session(hours, watch)?;
+                Ok(())
+            }
+            Some(Commands::Brief { generate }) => {
+                if generate {
+                    crate::compression::generate_project_brief()?;
+                } else {
+                    crate::compression::show_project_brief();
+                }
                 Ok(())
             }
             Some(Commands::CompressWeb { url }) => {

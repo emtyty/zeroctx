@@ -13,28 +13,23 @@ impl OutputFilter for GitFilter {
     }
 
     fn matches(&self, command: &str) -> bool {
-        command.starts_with("git ") || command.starts_with("gh ")
+        let cmd = command.split_whitespace().next().unwrap_or("");
+        matches!(cmd, "git" | "gh")
     }
 
     fn filter(&self, output: &str, config: &Config) -> FilterResult {
         let original_lines = output.lines().count();
 
-        let filtered = if output.is_empty() {
-            return FilterResult::passthrough(output.to_string());
+        let filtered = if is_diff_output(output) {
+            filter_diff(output, config)
+        } else if is_log_output(output) {
+            filter_log(output, config)
+        } else if is_show_stat_output(output) {
+            filter_show_stat(output, config)
+        } else if is_status_output(output) {
+            filter_status(output, config)
         } else {
-            // Detect subcommand from output patterns
-            if is_diff_output(output) {
-                filter_diff(output, config)
-            } else if is_show_stat_output(output) {
-                filter_show_stat(output, config)
-            } else if is_log_output(output) {
-                filter_log(output, config)
-            } else if is_status_output(output) {
-                filter_status(output, config)
-            } else {
-                // Generic: truncate
-                truncate_output(output, config.limits.git_status_max_files * 3)
-            }
+            truncate_output(output, config.limits.tree_max_entries)
         };
 
         let filtered_lines = filtered.lines().count();
@@ -53,245 +48,343 @@ impl OutputFilter for GitFilter {
     }
 }
 
-// --- Detection ---
-
 fn is_diff_output(output: &str) -> bool {
-    output.contains("diff --git") || output.contains("@@") || output.starts_with("---")
+    output.lines().take(5).any(|l| {
+        l.starts_with("diff --git")
+            || l.starts_with("---")
+            || l.starts_with("+++")
+            || l.starts_with("@@")
+    })
 }
 
 fn is_log_output(output: &str) -> bool {
-    output.starts_with("commit ") || output.contains("\ncommit ")
+    output.lines().take(3).any(|l| l.starts_with("commit "))
 }
 
 fn is_show_stat_output(output: &str) -> bool {
-    // git show --stat: has commit header AND file stat lines (file | N +/-)
-    static STAT_LINE_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"(?m)^\s+\S+.*\|\s+\d+").expect("valid regex"));
-    is_log_output(output) && STAT_LINE_RE.is_match(output)
-}
-
-fn filter_show_stat(output: &str, config: &Config) -> String {
-    // git show --stat: preserve commit info + file stat summary
-    // Short outputs: pass through entirely; long outputs: truncate
-    let max_lines = config.limits.git_status_max_files * 3;
-    truncate_output(output, max_lines.max(50))
+    output.lines().any(|l| {
+        l.contains("|") && (l.contains("+") || l.contains("-"))
+            && l.split('|').count() == 2
+    })
 }
 
 fn is_status_output(output: &str) -> bool {
-    static STATUS_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"(?m)^[MADRCU\?\! ]{1,2} ").expect("valid regex"));
-    STATUS_RE.is_match(output)
-        || output.contains("On branch")
-        || output.contains("Changes to be committed")
+    let first = output.lines().next().unwrap_or("");
+    first.starts_with("On branch")
+        || first.starts_with("HEAD detached")
         || output.contains("Changes not staged")
+        || output.contains("Changes to be committed")
         || output.contains("Untracked files")
+        || output.contains("nothing to commit")
 }
 
-// --- Git Diff Filter ---
-// Strategy: show stat summary first, then compact hunks with line limits
+/// Represents a single file in a diff with its change stats.
+struct DiffFile {
+    name: String,
+    additions: usize,
+    deletions: usize,
+    lines: Vec<String>,
+}
 
+/// Filter git diff output. If total content lines > 300: stat view + top 3 files.
 fn filter_diff(output: &str, config: &Config) -> String {
-    let max_hunk_lines = config.limits.git_diff_max_hunk_lines;
-    let mut result = Vec::new();
-    let mut _current_file: Option<String> = None;
-    let mut hunk_lines = 0;
-    let mut total_additions = 0;
-    let mut total_deletions = 0;
-    let mut files_changed = 0;
-    let mut in_hunk = false;
-    let mut hunk_truncated = false;
+    static NOISE_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"^(index [0-9a-f]+\.\.[0-9a-f]+|old mode|new mode|Binary files|diff --git)")
+            .expect("valid regex")
+    });
 
-    for line in output.lines() {
-        if line.starts_with("diff --git") {
-            // New file diff
-            if hunk_truncated {
-                result.push(format!("  ... ({} more lines in hunk)", hunk_lines - max_hunk_lines));
-            }
-            files_changed += 1;
-            _current_file = line.split(" b/").nth(1).map(|s| s.to_string());
-            hunk_lines = 0;
-            in_hunk = false;
-            hunk_truncated = false;
-            result.push(line.to_string());
-        } else if line.starts_with("@@") {
-            // Hunk header
-            if hunk_truncated {
-                result.push(format!("  ... ({} more lines)", hunk_lines - max_hunk_lines));
+    let clean: Vec<&str> = output
+        .lines()
+        .filter(|l| !NOISE_RE.is_match(l))
+        .collect();
+
+    let total_content_lines: usize = clean
+        .iter()
+        .filter(|l| {
+            let s = l.trim_start();
+            (s.starts_with('+') || s.starts_with('-'))
+                && !s.starts_with("---") && !s.starts_with("+++")
+        })
+        .count();
+
+    if total_content_lines > 300 {
+        let files = collect_diff_files(output, config);
+        let summary = format!("{} files changed", files.len());
+        return format_large_diff(&files, &summary, total_content_lines);
+    }
+
+    let max_per_hunk = config.limits.git_diff_max_hunk_lines;
+    let mut result = Vec::new();
+    let mut hunk_lines = 0usize;
+    let mut hunk_skipped = 0usize;
+    let mut in_hunk = false;
+
+    for line in &clean {
+        if line.starts_with("@@") {
+            if hunk_skipped > 0 {
+                result.push(format!("  ... ({} more lines)", hunk_skipped));
+                hunk_skipped = 0;
             }
             hunk_lines = 0;
             in_hunk = true;
-            hunk_truncated = false;
             result.push(line.to_string());
-        } else if line.starts_with("index ") || line.starts_with("--- ") || line.starts_with("+++ ") {
-            // File headers — keep
+        } else if line.starts_with("--- ") || line.starts_with("+++ ") {
+            in_hunk = false;
+            hunk_lines = 0;
+            if hunk_skipped > 0 {
+                result.push(format!("  ... ({} more lines)", hunk_skipped));
+                hunk_skipped = 0;
+            }
             result.push(line.to_string());
         } else if in_hunk {
-            hunk_lines += 1;
-            if line.starts_with('+') && !line.starts_with("+++") {
-                total_additions += 1;
-            } else if line.starts_with('-') && !line.starts_with("---") {
-                total_deletions += 1;
-            }
-            if hunk_lines <= max_hunk_lines {
+            if hunk_lines < max_per_hunk {
                 result.push(line.to_string());
+                hunk_lines += 1;
             } else {
-                hunk_truncated = true;
+                hunk_skipped += 1;
             }
         } else {
             result.push(line.to_string());
         }
     }
 
-    if hunk_truncated {
-        result.push(format!("  ... ({} more lines)", hunk_lines - max_hunk_lines));
+    if hunk_skipped > 0 {
+        result.push(format!("  ... ({} more lines)", hunk_skipped));
     }
 
-    // Prepend summary
-    let summary = format!(
-        "{} file(s) changed, {} insertions(+), {} deletions(-)",
-        files_changed, total_additions, total_deletions
-    );
-
-    format!("{}\n\n{}", summary, result.join("\n"))
+    result.join("\n")
 }
 
-// --- Git Log Filter ---
-// Strategy: one-line format per commit, limit total entries
-
-fn filter_log(output: &str, _config: &Config) -> String {
-    static COMMIT_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"^commit ([a-f0-9]{7,40})").expect("valid regex"));
-    static AUTHOR_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"^Author:\s+(.+)").expect("valid regex"));
-    static DATE_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"^Date:\s+(.+)").expect("valid regex"));
-
-    let max_entries = 20;
-    let mut entries = Vec::new();
-    let mut current_hash = String::new();
-    let mut current_author = String::new();
-    let mut current_date = String::new();
-    let mut current_message = String::new();
+fn collect_diff_files(output: &str, _config: &Config) -> Vec<DiffFile> {
+    let mut files: Vec<DiffFile> = Vec::new();
+    let mut current: Option<DiffFile> = None;
 
     for line in output.lines() {
-        if let Some(caps) = COMMIT_RE.captures(line) {
-            // Save previous entry
-            if !current_hash.is_empty() {
-                entries.push(format!(
-                    "{} {} ({}, {})",
-                    &current_hash[..7.min(current_hash.len())],
-                    current_message.trim(),
-                    current_author.split('<').next().unwrap_or("").trim(),
-                    current_date.trim(),
-                ));
+        if line.starts_with("diff --git ") {
+            if let Some(f) = current.take() {
+                files.push(f);
             }
-            current_hash = caps.get(1).map_or("", |m| m.as_str()).to_string();
-            current_author.clear();
-            current_date.clear();
-            current_message.clear();
-        } else if let Some(caps) = AUTHOR_RE.captures(line) {
-            current_author = caps.get(1).map_or("", |m| m.as_str()).to_string();
-        } else if let Some(caps) = DATE_RE.captures(line) {
-            current_date = caps.get(1).map_or("", |m| m.as_str()).to_string();
-        } else if !line.trim().is_empty() && !current_hash.is_empty() && current_message.is_empty() {
-            current_message = line.trim().to_string();
+            let name = line
+                .split_whitespace()
+                .last()
+                .unwrap_or("unknown")
+                .trim_start_matches("b/")
+                .to_string();
+            current = Some(DiffFile {
+                name,
+                additions: 0,
+                deletions: 0,
+                lines: Vec::new(),
+            });
+        } else if let Some(ref mut f) = current {
+            if line.starts_with('+') && !line.starts_with("+++") {
+                f.additions += 1;
+                f.lines.push(line.to_string());
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                f.deletions += 1;
+                f.lines.push(line.to_string());
+            } else if !line.starts_with("index ")
+                && !line.starts_with("old mode")
+                && !line.starts_with("new mode")
+                && !line.starts_with("Binary")
+            {
+                f.lines.push(line.to_string());
+            }
         }
     }
 
-    // Last entry
-    if !current_hash.is_empty() {
-        entries.push(format!(
-            "{} {} ({}, {})",
-            &current_hash[..7.min(current_hash.len())],
-            current_message.trim(),
-            current_author.split('<').next().unwrap_or("").trim(),
-            current_date.trim(),
+    if let Some(f) = current {
+        files.push(f);
+    }
+
+    files
+}
+
+fn format_large_diff(files: &[DiffFile], summary: &str, total_lines: usize) -> String {
+    let mut result = Vec::new();
+
+    result.push(format!(
+        "// [Large diff: {} content lines — showing stat + top 3 files]",
+        total_lines
+    ));
+    result.push(summary.to_string());
+    result.push(String::new());
+
+    let mut sorted_indices: Vec<usize> = (0..files.len()).collect();
+    sorted_indices.sort_by(|&a, &b| {
+        let ta = files[a].additions + files[a].deletions;
+        let tb = files[b].additions + files[b].deletions;
+        tb.cmp(&ta)
+    });
+
+    const BAR_WIDTH: usize = 40;
+    let max_changes = sorted_indices
+        .first()
+        .map(|&i| files[i].additions + files[i].deletions)
+        .unwrap_or(1)
+        .max(1);
+
+    for &idx in &sorted_indices {
+        let f = &files[idx];
+        let total = f.additions + f.deletions;
+        let bar_len = total * BAR_WIDTH / max_changes;
+        let add_len = f.additions * bar_len / total.max(1);
+        let del_len = bar_len.saturating_sub(add_len);
+        let bar = format!("{}{}", "+".repeat(add_len), "-".repeat(del_len));
+        result.push(format!(" {:50} | {:>4} {}", f.name, total, bar));
+    }
+
+    result.push(String::new());
+
+    let top3 = sorted_indices.iter().take(3);
+    for &idx in top3 {
+        let f = &files[idx];
+        result.push(format!("// === {} (+{} -{}) ===", f.name, f.additions, f.deletions));
+        for line in &f.lines {
+            result.push(line.clone());
+        }
+        result.push(String::new());
+    }
+
+    if files.len() > 3 {
+        result.push(format!(
+            "// [Remaining {} files omitted. Run 'git diff' directly for full output.]",
+            files.len() - 3
         ));
     }
 
-    let total = entries.len();
-    if total > max_entries {
-        let mut result: Vec<String> = entries[..max_entries].to_vec();
-        result.push(format!("... ({} more commits)", total - max_entries));
-        result.join("\n")
-    } else {
-        entries.join("\n")
+    result.join("\n")
+}
+
+fn filter_log(output: &str, config: &Config) -> String {
+    static HASH_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^commit ([0-9a-f]{40})").expect("valid regex"));
+
+    let max = config.limits.tree_max_entries;
+    let mut result = Vec::new();
+    let mut entry_count = 0usize;
+    let mut current_entry: Vec<&str> = Vec::new();
+
+    for line in output.lines() {
+        if HASH_RE.is_match(line) {
+            if !current_entry.is_empty() {
+                if entry_count >= max {
+                    let remaining = output
+                        .lines()
+                        .filter(|l| HASH_RE.is_match(l))
+                        .count()
+                        .saturating_sub(entry_count);
+                    if remaining > 0 {
+                        result.push(format!("... ({} more commits)", remaining));
+                    }
+                    break;
+                }
+                flush_log_entry(&mut result, &current_entry);
+                entry_count += 1;
+                current_entry.clear();
+            }
+            current_entry.push(line);
+        } else {
+            current_entry.push(line);
+        }
+    }
+
+    if entry_count < max && !current_entry.is_empty() {
+        flush_log_entry(&mut result, &current_entry);
+    }
+
+    result.join("\n")
+}
+
+fn flush_log_entry(result: &mut Vec<String>, entry: &[&str]) {
+    if let Some(hash_line) = entry.first() {
+        let short_hash = &hash_line.get(7..15).unwrap_or("");
+        let author = entry
+            .iter()
+            .find(|l| l.starts_with("Author:"))
+            .map(|l| l.trim_start_matches("Author:").trim())
+            .unwrap_or("");
+        let date = entry
+            .iter()
+            .find(|l| l.starts_with("Date:"))
+            .map(|l| l.trim_start_matches("Date:").trim())
+            .unwrap_or("");
+        let subject = entry
+            .iter()
+            .skip_while(|l| !l.starts_with("Date:"))
+            .skip(1)
+            .find(|l| !l.trim().is_empty())
+            .map(|l| l.trim())
+            .unwrap_or("");
+        result.push(format!("{} {} ({}, {})", short_hash, subject, author, date));
     }
 }
 
-// --- Git Status Filter ---
-// Strategy: group by state, limit files per group
+fn filter_show_stat(output: &str, config: &Config) -> String {
+    truncate_output(output, config.limits.tree_max_entries * 3)
+}
 
 fn filter_status(output: &str, config: &Config) -> String {
-    let max_files = config.limits.git_status_max_files;
-    let mut staged = Vec::new();
-    let mut unstaged = Vec::new();
-    let mut untracked = Vec::new();
+    let max_per_group = config.limits.git_status_max_files;
+    let mut result = Vec::new();
+    let mut group_count = 0usize;
+    let mut in_file_list = false;
+    let mut skipped = 0usize;
 
     for line in output.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            if skipped > 0 {
+                result.push(format!("  ... ({} more files)", skipped));
+                skipped = 0;
+            }
+            group_count = 0;
+            in_file_list = false;
+            result.push(String::new());
             continue;
         }
 
-        // Porcelain format: XY filename
-        if trimmed.len() > 3 {
-            let (xy, _rest) = trimmed.split_at(2.min(trimmed.len()));
-            let first = xy.chars().next().unwrap_or(' ');
-            let second = xy.chars().nth(1).unwrap_or(' ');
+        if line.starts_with("On branch")
+            || line.starts_with("HEAD")
+            || line.contains("Changes to be committed")
+            || line.contains("Changes not staged")
+            || line.contains("Untracked files")
+            || line.contains("nothing to commit")
+            || line.contains("Your branch")
+        {
+            if skipped > 0 {
+                result.push(format!("  ... ({} more files)", skipped));
+                skipped = 0;
+            }
+            group_count = 0;
+            in_file_list = false;
+            result.push(line.to_string());
+            continue;
+        }
 
-            if first == '?' && second == '?' {
-                untracked.push(trimmed.to_string());
-            } else if second != ' ' {
-                unstaged.push(trimmed.to_string());
-            } else if first != ' ' {
-                staged.push(trimmed.to_string());
+        if trimmed.starts_with('(') {
+            in_file_list = true;
+            result.push(line.to_string());
+            continue;
+        }
+
+        if in_file_list {
+            if group_count < max_per_group {
+                result.push(line.to_string());
+                group_count += 1;
             } else {
-                // Header lines like "On branch main"
-                staged.push(trimmed.to_string()); // Keep informational lines
+                skipped += 1;
             }
         } else {
-            staged.push(trimmed.to_string());
+            result.push(line.to_string());
         }
     }
 
-    let mut result = Vec::new();
-
-    if !staged.is_empty() {
-        result.push(format!("Staged ({}):", staged.len()));
-        for f in staged.iter().take(max_files) {
-            result.push(format!("  {}", f));
-        }
-        if staged.len() > max_files {
-            result.push(format!("  ... ({} more)", staged.len() - max_files));
-        }
+    if skipped > 0 {
+        result.push(format!("  ... ({} more files)", skipped));
     }
 
-    if !unstaged.is_empty() {
-        result.push(format!("Unstaged ({}):", unstaged.len()));
-        for f in unstaged.iter().take(max_files) {
-            result.push(format!("  {}", f));
-        }
-        if unstaged.len() > max_files {
-            result.push(format!("  ... ({} more)", unstaged.len() - max_files));
-        }
-    }
-
-    if !untracked.is_empty() {
-        result.push(format!("Untracked ({}):", untracked.len()));
-        for f in untracked.iter().take(max_files) {
-            result.push(format!("  {}", f));
-        }
-        if untracked.len() > max_files {
-            result.push(format!("  ... ({} more)", untracked.len() - max_files));
-        }
-    }
-
-    if result.is_empty() {
-        "Nothing to commit, working tree clean".to_string()
-    } else {
-        result.join("\n")
-    }
+    result.join("\n")
 }
 
 fn truncate_output(output: &str, max_lines: usize) -> String {
@@ -299,7 +392,8 @@ fn truncate_output(output: &str, max_lines: usize) -> String {
     if lines.len() <= max_lines {
         return output.to_string();
     }
-    let mut result: Vec<String> = lines[..max_lines].iter().map(|s| s.to_string()).collect();
-    result.push(format!("... ({} more lines)", lines.len() - max_lines));
-    result.join("\n")
+    let remaining_msg = format!("... ({} more lines)", lines.len() - max_lines);
+    let mut r: Vec<String> = lines[..max_lines].iter().map(|l| l.to_string()).collect();
+    r.push(remaining_msg);
+    r.join("\n")
 }

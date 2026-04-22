@@ -5,6 +5,7 @@ use std::path::PathBuf;
 const BASH_HOOK_TEMPLATE: &str = include_str!("../../hooks/zeroctx-rewrite.sh");
 const READ_HOOK_TEMPLATE: &str = include_str!("../../hooks/zeroctx-read.sh");
 const CLAUDE_MD_CONTENT: &str = include_str!("../../CLAUDE.md");
+const POST_TOOL_HOOK_TEMPLATE: &str = include_str!("../../hooks/zeroctx-post-tool.sh");
 
 /// Install the Claude Code PreToolUse hooks.
 ///
@@ -66,6 +67,19 @@ pub fn install_with_options(project: bool) -> Result<()> {
     let bash_command = normalize_path(&bash_hook_path);
     let read_command = normalize_path(&read_hook_path);
 
+    // Write PostToolUse hook script
+    let post_hook_path = hooks_dir.join("zeroctx-post-tool.sh");
+    let post_hook = POST_TOOL_HOOK_TEMPLATE.replace("__ZERO_PATH__", &zero_path_str);
+    std::fs::write(&post_hook_path, &post_hook)
+        .with_context(|| format!("Failed to write {}", post_hook_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&post_hook_path, perms).ok();
+    }
+    let post_hook_command = normalize_path(&post_hook_path);
+
     let bash_entry = serde_json::json!({
         "matcher": "Bash",
         "hooks": [{ "type": "command", "command": bash_command }]
@@ -73,6 +87,14 @@ pub fn install_with_options(project: bool) -> Result<()> {
     let read_entry = serde_json::json!({
         "matcher": "Read",
         "hooks": [{ "type": "command", "command": read_command }]
+    });
+    let post_glob_entry = serde_json::json!({
+        "matcher": "Glob",
+        "hooks": [{ "type": "command", "command": post_hook_command }]
+    });
+    let post_grep_entry = serde_json::json!({
+        "matcher": "Grep",
+        "hooks": [{ "type": "command", "command": post_hook_command }]
     });
 
     // Insert hooks, preserving existing non-zeroctx hooks
@@ -104,6 +126,22 @@ pub fn install_with_options(project: bool) -> Result<()> {
 
     arr.push(bash_entry);
     arr.push(read_entry);
+
+    // PostToolUse hooks for Glob and Grep compression
+    let post_tool_use = hooks_obj
+        .entry("PostToolUse")
+        .or_insert_with(|| serde_json::json!([]));
+    if let Some(post_arr) = post_tool_use.as_array_mut() {
+        post_arr.retain(|entry| {
+            !entry
+                .pointer("/hooks/0/command")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("zeroctx"))
+                .unwrap_or(false)
+        });
+        post_arr.push(post_glob_entry);
+        post_arr.push(post_grep_entry);
+    }
 
     let content = serde_json::to_string_pretty(&settings)?;
     std::fs::write(&settings_path, &content)

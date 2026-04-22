@@ -608,3 +608,133 @@ mod tests {
         assert!(result.is_empty(), "unknown language should return empty");
     }
 }
+
+impl AstCompressor {
+    /// Compress source focusing on code near the given error line numbers.
+    ///
+    /// Functions containing an error line are extracted in full.
+    /// All other definitions get signatures only.
+    pub fn compress_around_lines(source: &str, language: Language, lines: &[usize]) -> Result<String> {
+        if lines.is_empty() {
+            return Self::signatures_only(source, language);
+        }
+        let mut parser = match Self::make_parser(language) {
+            Some(p) => p,
+            None => return Self::regex_compress_around_lines(source, language, lines),
+        };
+        let tree = parser
+            .parse(source, None)
+            .ok_or_else(|| anyhow::anyhow!("tree-sitter parse failed"))?;
+        let root = tree.root_node();
+
+        // Find all top-level definition nodes
+        let mut focused: Vec<String> = Vec::new();
+        let mut sigs: Vec<String> = Vec::new();
+        let source_bytes = source.as_bytes();
+
+        Self::collect_around_lines(root, source_bytes, language, lines, 0, &mut focused, &mut sigs);
+
+        if focused.is_empty() && sigs.is_empty() {
+            return Self::signatures_only(source, language);
+        }
+
+        let mut out = Vec::new();
+        if !focused.is_empty() {
+            out.push(format!("// [Error context — full function bodies:]"));
+            out.extend(focused);
+        }
+        if !sigs.is_empty() {
+            out.push(format!("// [Other definitions — signatures only:]"));
+            out.extend(sigs);
+        }
+        Ok(out.join("\n"))
+    }
+
+    fn collect_around_lines(
+        node: Node,
+        source: &[u8],
+        language: Language,
+        target_lines: &[usize],
+        depth: usize,
+        focused: &mut Vec<String>,
+        sigs: &mut Vec<String>,
+    ) {
+        if Self::is_definition_node(node.kind(), language) {
+            let start_line = node.start_position().row;
+            let end_line = node.end_position().row;
+
+            // Check if any target line falls within this node
+            let is_relevant = target_lines
+                .iter()
+                .any(|&line| line >= start_line && line <= end_line);
+
+            if is_relevant {
+                // Extract full text of this definition
+                if let Ok(text) = std::str::from_utf8(&source[node.start_byte()..node.end_byte()]) {
+                    let indent = "  ".repeat(depth);
+                    focused.push(format!("{}{}", indent, text));
+                }
+            } else {
+                // Signature only
+                let sig = Self::extract_signature(node, std::str::from_utf8(source).unwrap_or(""), language);
+                if !sig.is_empty() {
+                    let indent = "  ".repeat(depth);
+                    sigs.push(format!("{}{}", indent, sig));
+                }
+            }
+
+            // Recurse into container nodes for nested definitions
+            if is_relevant && Self::is_container_node(node.kind(), language) {
+                if let Some(body) = Self::find_body_node(node, language) {
+                    let mut cursor = body.walk();
+                    for child in body.children(&mut cursor) {
+                        if Self::is_definition_node(child.kind(), language) {
+                            let child_start = child.start_position().row;
+                            let child_end = child.end_position().row;
+                            let child_relevant = target_lines
+                                .iter()
+                                .any(|&line| line >= child_start && line <= child_end);
+                            if child_relevant {
+                                if let Ok(text) = std::str::from_utf8(&source[child.start_byte()..child.end_byte()]) {
+                                    focused.push(format!("  {}", text));
+                                }
+                            } else {
+                                let sig = Self::extract_signature(child, std::str::from_utf8(source).unwrap_or(""), language);
+                                if !sig.is_empty() {
+                                    sigs.push(format!("  {}", sig));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Recurse into non-definition nodes
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            Self::collect_around_lines(child, source, language, target_lines, depth, focused, sigs);
+        }
+    }
+
+    fn regex_compress_around_lines(source: &str, _language: Language, target_lines: &[usize]) -> Result<String> {
+        // Fallback: extract ±20 lines around each error line
+        let lines: Vec<&str> = source.lines().collect();
+        let mut included: Vec<bool> = vec![false; lines.len()];
+        for &target in target_lines {
+            let start = target.saturating_sub(10);
+            let end = (target + 10).min(lines.len().saturating_sub(1));
+            for i in start..=end {
+                included[i] = true;
+            }
+        }
+        let result: Vec<&str> = lines
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| included[*i])
+            .map(|(_, l)| *l)
+            .collect();
+        Ok(result.join("\n"))
+    }
+}

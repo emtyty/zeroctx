@@ -234,6 +234,34 @@ impl Tracker {
         )?;
         Ok(deleted)
     }
+
+    /// Get session summary for the last N hours.
+    pub fn get_session_summary(&self, hours: u32) -> Result<SessionSummary> {
+        let offset = format!("-{} hours", hours);
+        let mut stmt = self.conn.prepare(
+            "SELECT
+                COUNT(*) as commands,
+                COALESCE(SUM(input_tokens), 0) as total_input,
+                COALESCE(SUM(output_tokens), 0) as total_output,
+                COALESCE(SUM(input_tokens - output_tokens), 0) as tokens_saved,
+                MIN(timestamp) as session_start
+             FROM tracking
+             WHERE timestamp >= datetime('now', ?1)",
+        )?;
+
+        let result = stmt.query_row([offset], |row| {
+            Ok(SessionSummary {
+                commands_run: row.get(0)?,
+                total_input_tokens: row.get(1)?,
+                total_output_tokens: row.get(2)?,
+                tokens_saved: row.get(3).unwrap_or(0),
+                session_start: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                hours,
+            })
+        })?;
+
+        Ok(result)
+    }
 }
 
 fn default_db_path() -> Result<PathBuf> {
@@ -270,6 +298,43 @@ pub struct DailyStats {
     pub input_tokens: usize,
     pub output_tokens: usize,
     pub avg_savings: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub commands_run: usize,
+    pub total_input_tokens: usize,
+    pub total_output_tokens: usize,
+    pub tokens_saved: i64,
+    pub session_start: String,
+    pub hours: u32,
+}
+
+impl SessionSummary {
+    /// Estimated cost in USD (rough Claude Sonnet pricing).
+    pub fn estimated_cost_usd(&self) -> f64 {
+        // Claude Sonnet: ~$3/M input, $15/M output (rough average)
+        let input_cost = self.total_input_tokens as f64 * 3.0 / 1_000_000.0;
+        let output_cost = self.total_output_tokens as f64 * 15.0 / 1_000_000.0;
+        input_cost + output_cost
+    }
+
+    /// Estimated cost without ZeroCTX (using input_tokens as the "would have been" baseline).
+    pub fn estimated_cost_without_usd(&self) -> f64 {
+        let total = self.total_input_tokens as i64 + self.tokens_saved;
+        let input_cost = total.max(0) as f64 * 3.0 / 1_000_000.0;
+        let output_cost = self.total_output_tokens as f64 * 15.0 / 1_000_000.0;
+        input_cost + output_cost
+    }
+
+    pub fn savings_percent(&self) -> f64 {
+        let total_would_be = self.total_input_tokens as i64 + self.tokens_saved;
+        if total_would_be > 0 {
+            self.tokens_saved as f64 / total_would_be as f64 * 100.0
+        } else {
+            0.0
+        }
+    }
 }
 
 #[cfg(test)]

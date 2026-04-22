@@ -119,3 +119,54 @@ fn truncate(s: &str, max_len: usize) -> String {
         format!("{}...", &s[..max_len])
     }
 }
+
+/// Extract file:line pairs from error output for error-line-aware AST compression.
+/// Returns Vec<(file_path, line_number_0indexed)>.
+pub fn extract_error_locations(stderr: &str) -> Vec<(String, usize)> {
+    use once_cell::sync::Lazy;
+    use regex::Regex;
+
+    // Python: File "path/to/file.py", line 42
+    static PY_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"File ["']([^"']+\.py)["'],\s*line\s+(\d+)"#).expect("valid regex")
+    });
+    // Rust: src/foo.rs:42:5 or --> src/foo.rs:42:5
+    static RS_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"(?:-->)?\s*([a-zA-Z0-9_./\-]+\.rs):(\d+):\d+").expect("valid regex")
+    });
+    // JS/TS: file.js:42:5 or file.ts:42:5
+    static JS_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"([a-zA-Z0-9_./\-]+\.[jt]sx?):(\d+):\d+").expect("valid regex")
+    });
+    // C#: file.cs(42,5) or  File.cs:line 42
+    static CS_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"([a-zA-Z0-9_./\-]+\.cs)\((\d+),\d+\)").expect("valid regex")
+    });
+
+    let mut results: Vec<(String, usize)> = Vec::new();
+    let regexes: &[(&Lazy<Regex>, usize, usize)] = &[
+        (&PY_RE, 1, 2),
+        (&RS_RE, 1, 2),
+        (&JS_RE, 1, 2),
+        (&CS_RE, 1, 2),
+    ];
+
+    for (re, path_group, line_group) in regexes {
+        for caps in re.captures_iter(stderr) {
+            let path = caps.get(*path_group).map_or("", |m| m.as_str()).to_string();
+            let line: usize = caps
+                .get(*line_group)
+                .and_then(|m| m.as_str().parse::<usize>().ok())
+                .unwrap_or(1)
+                .saturating_sub(1); // convert to 0-indexed
+            if !path.is_empty() {
+                results.push((path, line));
+            }
+        }
+    }
+
+    // Deduplicate by (path, line)
+    results.sort();
+    results.dedup();
+    results
+}
