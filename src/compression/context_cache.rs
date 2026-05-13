@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use md5::{Digest, Md5};
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// MD5-based file deduplication cache with optional SQLite persistence.
@@ -26,12 +27,17 @@ impl ContextCache {
     }
 
     /// Open a persistent cache backed by SQLite at the default zeroctx directory.
+    /// Runs the 30-day cleanup. Prefer `with_shared` for the process-wide
+    /// singleton, which runs cleanup only once.
     pub fn open_default() -> Result<Self> {
-        let db_path = cache_db_path()?;
+        Self::open_at(&cache_db_path()?, /* cleanup = */ true)
+    }
+
+    fn open_at(db_path: &Path, cleanup: bool) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(&db_path)?;
+        let conn = Connection::open(db_path)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS file_cache (
                 path TEXT PRIMARY KEY,
@@ -43,11 +49,23 @@ impl ContextCache {
             );
             CREATE INDEX IF NOT EXISTS idx_file_cache_path ON file_cache(path);",
         )?;
-        // Remove entries older than 30 days
-        conn.execute(
-            "DELETE FROM file_cache WHERE last_seen < ?1",
-            [unix_now() - 30 * 24 * 3600],
-        )?;
+        if cleanup {
+            // Skip cleanup if the clock is unreadable - otherwise we'd delete every row
+            // (last_seen < negative_threshold matches everything).
+            if let Some(now) = unix_now() {
+                let cutoff = now - 30 * 24 * 3600;
+                if cutoff > 0 {
+                    conn.execute(
+                        "DELETE FROM file_cache WHERE last_seen < ?1",
+                        [cutoff],
+                    )?;
+                }
+            } else {
+                tracing::warn!(
+                    "context_cache: system clock unreadable, skipping 30-day cleanup"
+                );
+            }
+        }
         Ok(Self {
             hashes: HashMap::new(),
             summaries: HashMap::new(),
@@ -80,18 +98,21 @@ impl ContextCache {
     }
 
     /// Store compressed content with mtime for future cache hits.
+    /// Errors if the cache is in-memory-only (no SQLite connection).
     pub fn store_compressed(&self, path: &str, content: &str, compressed: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| anyhow!("context_cache: no persistent connection (in-memory only)"))?;
         let hash = Self::hash(content);
         let summary = Self::generate_summary(path, content);
         let mtime = get_mtime(path) as i64;
-        let now = unix_now();
-        if let Some(ref conn) = self.conn {
-            conn.execute(
-                "INSERT OR REPLACE INTO file_cache (path, hash, mtime, compressed, summary, last_seen)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![path, hash, mtime, compressed, summary, now],
-            )?;
-        }
+        let now = unix_now().unwrap_or(0);
+        conn.execute(
+            "INSERT OR REPLACE INTO file_cache (path, hash, mtime, compressed, summary, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![path, hash, mtime, compressed, summary, now],
+        )?;
         Ok(())
     }
 
@@ -153,6 +174,38 @@ impl Default for ContextCache {
     }
 }
 
+/// Process-wide cache singleton. First caller pays the open + cleanup cost;
+/// subsequent callers reuse the same connection. On open failure the singleton
+/// stays empty, a warning is logged once, and `with_shared` becomes a no-op so
+/// callers don't need to special-case it.
+static SHARED: OnceLock<Option<Mutex<ContextCache>>> = OnceLock::new();
+
+fn shared_cell() -> &'static Option<Mutex<ContextCache>> {
+    SHARED.get_or_init(|| match ContextCache::open_default() {
+        Ok(cache) => Some(Mutex::new(cache)),
+        Err(e) => {
+            tracing::warn!(
+                "context_cache: failed to open persistent cache, running without it: {}",
+                e
+            );
+            None
+        }
+    })
+}
+
+/// Run a closure against the shared cache. Returns `None` if the persistent
+/// cache is unavailable (so callers can skip rather than retry-then-fail).
+pub fn with_shared<R>(f: impl FnOnce(MutexGuard<'_, ContextCache>) -> R) -> Option<R> {
+    let cell = shared_cell().as_ref()?;
+    match cell.lock() {
+        Ok(guard) => Some(f(guard)),
+        Err(poisoned) => {
+            tracing::warn!("context_cache: mutex poisoned, recovering");
+            Some(f(poisoned.into_inner()))
+        }
+    }
+}
+
 fn cache_db_path() -> Result<PathBuf> {
     let base = if cfg!(windows) {
         std::env::var("APPDATA")
@@ -175,11 +228,14 @@ fn get_mtime(path: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn unix_now() -> i64 {
+/// Current unix timestamp, or `None` if the system clock is unreadable.
+/// Callers should treat `None` as "skip whatever time-based logic this is for"
+/// rather than substituting 0 (which can make `last_seen < cutoff` match everything).
+fn unix_now() -> Option<i64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
+        .ok()
         .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

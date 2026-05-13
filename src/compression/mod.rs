@@ -18,11 +18,18 @@ const COMPRESS_THRESHOLD: usize = 80;
 /// - Files >= 80 lines: strip blank lines, comments, and collapse whitespace
 /// - Code files >= 80 lines: extract signatures + key definitions
 pub fn compress_file(path: &str, _config: &Config) -> Result<String> {
-    // Fast path: check mtime-based persistent cache before reading the file
-    if let Ok(cache) = context_cache::ContextCache::open_default() {
-        if let Ok(Some(cached)) = cache.check_mtime(path) {
-            return Ok(cached);
+    // Fast path: check mtime-based persistent cache before reading the file.
+    // Uses the process-wide singleton so we don't pay open + cleanup per call.
+    let cached_hit = context_cache::with_shared(|cache| match cache.check_mtime(path) {
+        Ok(hit) => hit,
+        Err(e) => {
+            tracing::warn!("context_cache: mtime lookup for {} failed: {}", path, e);
+            None
         }
+    })
+    .flatten();
+    if let Some(cached) = cached_hit {
+        return Ok(cached);
     }
 
     let content = std::fs::read_to_string(path)?;
@@ -114,10 +121,13 @@ pub fn compress_file(path: &str, _config: &Config) -> Result<String> {
 }
 
 /// Write result to persistent cache (best-effort, never fails the caller).
+/// Logs at warn level on failure so cache outages are visible in `zero` logs.
 fn cache_store(path: &str, content: &str, compressed: &str) {
-    if let Ok(cache) = context_cache::ContextCache::open_default() {
-        cache.store_compressed(path, content, compressed).ok();
-    }
+    context_cache::with_shared(|cache| {
+        if let Err(e) = cache.store_compressed(path, content, compressed) {
+            tracing::warn!("context_cache: store for {} failed: {}", path, e);
+        }
+    });
 }
 
 /// Compress a file and write the result to a temp file. Returns the temp path.
