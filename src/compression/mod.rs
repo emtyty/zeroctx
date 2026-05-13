@@ -56,12 +56,11 @@ pub fn compress_file(path: &str, _config: &Config) -> Result<String> {
                 0
             };
 
-            // Fallback to basic_compress when tree-sitter is too aggressive:
-            // (1) >90% savings on large files, or (2) <15 output lines from 200+ line file
+            // Fallback to basic_compress only when AST output looks empty of real signatures.
+            // High savings on config/constants/interface-heavy files is correct behavior;
+            // basic_compress (whitespace strip) carries less signal than an empty signature list.
             let compressed_lines = compressed.lines().count();
-            if (savings_pct > 90 && line_count > 200)
-                || (line_count > 200 && compressed_lines < 15)
-            {
+            if line_count > 200 && !has_signature_tokens(&compressed) {
                 // Fallback is expected behavior, not a mismatch — log as signal.
                 crate::core::mismatch::log_signal(
                     "aggressive_compression_fallback",
@@ -140,6 +139,39 @@ pub fn compress_to_temp(path: &str, config: &Config) -> Result<String> {
 }
 
 /// Basic compression: strip excessive blank lines, trim trailing whitespace.
+/// Returns true when the compressed output contains any real signature-bearing token.
+/// Used to distinguish a thin-but-valid AST extract (config/constants/interface file)
+/// from a degenerate one where tree-sitter found nothing useful.
+fn has_signature_tokens(s: &str) -> bool {
+    s.lines().any(|line| {
+        let t = line.trim_start();
+        t.starts_with("fn ")
+            || t.starts_with("pub ")
+            || t.starts_with("function ")
+            || t.starts_with("class ")
+            || t.starts_with("def ")
+            || t.starts_with("impl ")
+            || t.starts_with("trait ")
+            || t.starts_with("struct ")
+            || t.starts_with("enum ")
+            || t.starts_with("interface ")
+            || t.starts_with("type ")
+            || t.starts_with("import ")
+            || t.starts_with("export ")
+            || t.starts_with("use ")
+            || t.starts_with("from ")
+            || t.starts_with("namespace ")
+            || t.starts_with("mod ")
+            || t.starts_with("const ")
+            || t.starts_with("static ")
+            || t.starts_with("@")
+            || t.starts_with("async fn")
+            || t.starts_with("async function")
+            || t.starts_with("abstract class")
+            || t.starts_with("macro_rules!")
+    })
+}
+
 fn basic_compress(content: &str) -> String {
     let mut result = Vec::new();
     let mut blank_count = 0;
