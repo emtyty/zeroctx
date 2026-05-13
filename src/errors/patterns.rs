@@ -24,6 +24,25 @@ fn pip_command() -> &'static str {
     &PIP_CMD
 }
 
+/// Extract the bare npm package specifier from a possibly-deep module path.
+///
+/// `lodash/fp/curry` -> `lodash`
+/// `@scope/pkg/deep/path` -> `@scope/pkg`
+/// `@scope/pkg` -> `@scope/pkg`
+/// `@scope` -> `@scope` (malformed; pass through unchanged)
+fn bare_package_name(module: &str) -> &str {
+    if module.starts_with('@') {
+        let mut slashes = module.match_indices('/');
+        let _first = slashes.next();
+        match slashes.next() {
+            Some((idx, _)) => &module[..idx],
+            None => module,
+        }
+    } else {
+        module.split('/').next().unwrap_or(module)
+    }
+}
+
 /// A compiled error pattern with its handler.
 pub struct ErrorPattern {
     pub regex: Regex,
@@ -373,7 +392,7 @@ fn javascript_patterns() -> Vec<ErrorPattern> {
                         language: Language::JavaScript,
                     };
                 }
-                let package = module.split('/').next().unwrap_or(module);
+                let package = bare_package_name(module);
                 AutoFix {
                     fixable: true,
                     category: "js_module_not_found".into(),
@@ -399,7 +418,7 @@ fn javascript_patterns() -> Vec<ErrorPattern> {
                         language: Language::TypeScript,
                     };
                 }
-                let package = module.split('/').next().unwrap_or(module);
+                let package = bare_package_name(module);
                 AutoFix {
                     fixable: true,
                     category: "ts_module_not_found".into(),
@@ -593,11 +612,12 @@ fn javascript_patterns() -> Vec<ErrorPattern> {
                         language: Language::JavaScript,
                     };
                 }
+                let package = bare_package_name(module);
                 AutoFix {
                     fixable: true,
                     category: "js_bundler_resolve".into(),
                     explanation: format!("Bundler can't resolve '{}'. Installing.", module),
-                    command: Some(format!("npm install {}", module)),
+                    command: Some(format!("npm install {}", package)),
                     language: Language::JavaScript,
                 }
             },
@@ -1039,4 +1059,32 @@ fn rust_patterns() -> Vec<ErrorPattern> {
             },
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bare_package_name;
+
+    #[test]
+    fn bare_package_name_unscoped() {
+        assert_eq!(bare_package_name("lodash"), "lodash");
+        assert_eq!(bare_package_name("lodash/fp/curry"), "lodash");
+        assert_eq!(bare_package_name("react/jsx-runtime"), "react");
+    }
+
+    #[test]
+    fn bare_package_name_scoped() {
+        assert_eq!(bare_package_name("@scope/pkg"), "@scope/pkg");
+        assert_eq!(bare_package_name("@scope/pkg/sub/path"), "@scope/pkg");
+        assert_eq!(
+            bare_package_name("@creative-force/common-web-lib/components/EllipsisTextWithTooltip"),
+            "@creative-force/common-web-lib",
+        );
+    }
+
+    #[test]
+    fn bare_package_name_malformed() {
+        // Bare @scope with no name segment — pass through unchanged.
+        assert_eq!(bare_package_name("@scope"), "@scope");
+    }
 }
