@@ -34,6 +34,7 @@ impl AstCompressor {
             Language::JavaScript => tree_sitter_javascript::LANGUAGE,
             Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
             Language::CSharp => tree_sitter_c_sharp::LANGUAGE,
+            Language::Rust => tree_sitter_rust::LANGUAGE,
             _ => return None,
         };
         let mut parser = Parser::new();
@@ -137,6 +138,21 @@ impl AstCompressor {
                     | "enum_declaration"
                     | "struct_declaration"
             ),
+            Language::Rust => matches!(
+                kind,
+                "function_item"
+                    | "function_signature_item"
+                    | "struct_item"
+                    | "enum_item"
+                    | "trait_item"
+                    | "impl_item"
+                    | "mod_item"
+                    | "use_declaration"
+                    | "type_item"
+                    | "const_item"
+                    | "static_item"
+                    | "macro_definition"
+            ),
             _ => false,
         }
     }
@@ -154,6 +170,7 @@ impl AstCompressor {
                     | "namespace_declaration"
                     | "struct_declaration"
             ),
+            Language::Rust => matches!(kind, "impl_item" | "trait_item" | "mod_item"),
             _ => false,
         }
     }
@@ -163,6 +180,7 @@ impl AstCompressor {
             Language::Python => "block",
             Language::JavaScript | Language::TypeScript => "class_body",
             Language::CSharp => "declaration_list",
+            Language::Rust => "declaration_list",
             _ => return None,
         };
         let mut cursor = node.walk();
@@ -171,6 +189,13 @@ impl AstCompressor {
                 return Some(child);
             }
             if language == Language::Python && child.kind() == "class_definition" {
+                return Self::find_body_node(child, language);
+            }
+            // JS/TS: export_statement wraps class_declaration which contains class_body.
+            // Without this recursion, `export class Foo { method() {} }` drops all methods.
+            if matches!(language, Language::JavaScript | Language::TypeScript)
+                && matches!(child.kind(), "class_declaration" | "abstract_class_declaration")
+            {
                 return Self::find_body_node(child, language);
             }
         }
@@ -182,6 +207,7 @@ impl AstCompressor {
             Language::Python => Self::python_signature(node, source),
             Language::JavaScript | Language::TypeScript => Self::js_signature(node, source),
             Language::CSharp => Self::csharp_signature(node, source),
+            Language::Rust => Self::rust_signature(node, source),
             _ => String::new(),
         }
     }
@@ -314,6 +340,34 @@ impl AstCompressor {
         };
 
         Some((sig, body_for_recursion))
+    }
+
+    fn rust_signature(node: Node, source: &str) -> String {
+        match node.kind() {
+            "function_item" | "function_signature_item" => {
+                let text = node.utf8_text(source.as_bytes()).unwrap_or("");
+                let cutoff = text.find('{').or_else(|| text.find(';')).unwrap_or(text.len());
+                text[..cutoff].trim_end().to_string()
+            }
+            "impl_item" | "trait_item" | "mod_item" => {
+                let text = node.utf8_text(source.as_bytes()).unwrap_or("");
+                let cutoff = text.find('{').unwrap_or(text.len());
+                text[..cutoff].trim_end().to_string()
+            }
+            "struct_item" | "enum_item" => {
+                let text = node.utf8_text(source.as_bytes()).unwrap_or("");
+                let cutoff = text.find('{').or_else(|| text.find(';')).unwrap_or(text.len());
+                text[..cutoff].trim_end().to_string()
+            }
+            "use_declaration" | "type_item" | "const_item" | "static_item" => {
+                Self::node_first_line(node, source)
+            }
+            "macro_definition" => {
+                let name = Self::child_text(node, "name", source).unwrap_or_default();
+                format!("macro_rules! {}", name)
+            }
+            _ => String::new(),
+        }
     }
 
     fn csharp_signature(node: Node, source: &str) -> String {
@@ -583,6 +637,23 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn test_rust_ast_signatures() {
+        // Regression: Rust must use tree-sitter, not the regex fallback that
+        // strips bodies via the >90% / <15-line guardrail in mod.rs.
+        let source = "use std::io;\n\npub struct Config {\n    pub name: String,\n    pub count: usize,\n}\n\nimpl Config {\n    pub fn new(name: &str) -> Self {\n        Self { name: name.to_string(), count: 0 }\n    }\n    pub fn increment(&mut self) {\n        self.count += 1;\n    }\n}\n\npub trait Counter {\n    fn count(&self) -> usize;\n}\n\npub fn helper(x: i32) -> i32 {\n    x * 2\n}\n";
+        let result = AstCompressor::signatures_only(source, Language::Rust).unwrap();
+        assert!(result.contains("use std::io"), "should keep use, got: {}", result);
+        assert!(result.contains("pub struct Config"), "should keep struct, got: {}", result);
+        assert!(result.contains("impl Config"), "should keep impl, got: {}", result);
+        assert!(result.contains("pub fn new"), "should keep method new, got: {}", result);
+        assert!(result.contains("pub fn increment"), "should keep method increment, got: {}", result);
+        assert!(result.contains("pub trait Counter"), "should keep trait, got: {}", result);
+        assert!(result.contains("pub fn helper"), "should keep free fn, got: {}", result);
+        assert!(!result.contains("name.to_string()"), "should not include body, got: {}", result);
+        assert!(!result.contains("self.count += 1"), "should not include body, got: {}", result);
+    }
+
     fn test_rust_regex_fallback() {
         let source = "use std::io;\n\npub struct Config {\n    pub name: String,\n}\n\nimpl Config {\n    pub fn new(name: &str) -> Self {\n        Self { name: name.to_string() }\n    }\n}\n\nfn helper() -> bool {\n    true\n}\n";
         let result = AstCompressor::signatures_only(source, Language::Rust).unwrap();
@@ -599,6 +670,21 @@ mod tests {
         let result = AstCompressor::compress(source, Language::Python, &[]).unwrap();
         assert!(result.contains("def foo"), "should return signatures");
         assert!(result.contains("def bar"), "should return signatures");
+    }
+
+    #[test]
+    fn test_js_export_class_extracts_methods() {
+        // Regression: export_statement wrapping class_declaration must expose methods.
+        let source = "export class Page {
+    async openPage() { return 1; }
+    async verifyX() { return 2; }
+    async submit() { return 3; }
+}
+";
+        let result = AstCompressor::signatures_only(source, Language::TypeScript).unwrap();
+        assert!(result.contains("openPage"), "should contain openPage method, got: {}", result);
+        assert!(result.contains("verifyX"), "should contain verifyX method, got: {}", result);
+        assert!(result.contains("submit"), "should contain submit method, got: {}", result);
     }
 
     #[test]
