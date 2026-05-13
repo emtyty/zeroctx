@@ -5,7 +5,6 @@ pub mod network;
 pub mod python;
 pub mod rust_tools;
 pub mod system;
-pub mod toml_filter;
 
 use crate::config::Config;
 use crate::core::mismatch::{MismatchCategory, MismatchEvent, MismatchSeverity};

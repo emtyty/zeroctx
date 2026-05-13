@@ -62,15 +62,6 @@ impl IntentRouter {
         }
     }
 
-    fn classify_intent(
-        lower: &str,
-        urls: &[String],
-        commands: &[String],
-        files: &[PathBuf],
-    ) -> Intent {
-        Self::classify_intent_with_confidence(lower, urls, commands, files).0
-    }
-
     fn classify_intent_with_confidence(
         lower: &str,
         urls: &[String],
